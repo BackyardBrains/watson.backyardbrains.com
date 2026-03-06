@@ -1,6 +1,8 @@
 # Watson API
 
-Task and context API for [Backyard Brains](https://backyardbrains.com). Exposes projects, tasks, events, and an inbox via REST and [MCP](https://modelcontextprotocol.io).
+An API that connects AI assistants (ChatGPT, Claude, and others) to your tasks and projects. Ask "what should I work on?" and get a real answer from your task list instead of generic productivity advice.
+
+Watson exposes your projects, tasks, events, and an inbox via REST and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io)—the standard for connecting LLMs to tools.
 
 **Base URL:** https://watson.backyardbrains.com
 
