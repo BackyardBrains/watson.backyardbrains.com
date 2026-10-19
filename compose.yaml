@@ -1,0 +1,17 @@
+services:
+  watson-api:
+    build: .
+    image: byb-watson:standalone
+    container_name: watson-api
+    user: "1000:1000"
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      DATA_PATH: /data
+      USE_MEMORY_API: "true"
+      MEMORY_API_URL: https://memory.backyardbrains.com
+    volumes:
+      - /var/lib/byb/watson-runtime:/data
+      - /var/lib/byb/corpus:/corpus:rw
