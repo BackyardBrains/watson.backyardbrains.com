@@ -16,3 +16,6 @@ removing the compatibility path requires migrating each consumer first.
 
 The standalone source was imported from the running server on 2026-10-19,
 including queue, capture-quality, task-state and ideas modules missing upstream.
+
+Local isolated checks: `python3 tests/test_watson_ideas.py` and
+`python3 tests/test_watson_queue_steward.py`. These use temporary SQLite databases.
