@@ -8,7 +8,7 @@ Memory stays in its separate repository and systemd service at
 `/var/www/memory.backyardbrains.com`; PostgreSQL remains its source of truth.
 Watson supplies task workflows and MCP tools over that API, plus its worker queue.
 
-Build/restart only Watson: `docker compose up -d --build`.
+Build/restart only Watson: `./deploy.sh` (runs isolated tests and sets source revision).
 Do not run the retired OpenClaw compose stack.
 The old OpenClaw path is a compatibility symlink for existing BYB timers and
 containers. Those routines and their private state still need this runtime;

@@ -9,6 +9,8 @@ services:
       - "8080:8080"
     env_file: .env
     environment:
+      GIT_SHA: ${WATSON_GIT_SHA:-unknown}
+      GIT_BRANCH: main
       DATA_PATH: /data
       USE_MEMORY_API: "true"
       MEMORY_API_URL: https://memory.backyardbrains.com
