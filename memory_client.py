@@ -1235,10 +1235,15 @@ def get_summary() -> dict:
     tasks = get_tasks(include_complete=False, limit=15)
     today = datetime.now().strftime("%Y-%m-%d")
     events = get_events(from_date=today, limit=10)
-    dashboard_snapshot = latest_watson_dashboard_snapshot()
+    latest_snapshot = latest_watson_dashboard_snapshot()
+    # An expired packet describes a past day: report its identity, never its narrative.
+    dashboard_snapshot = latest_snapshot if dashboard_snapshot_is_fresh(latest_snapshot) else None
     dashboard_recommendations = dashboard_action_recommendations(dashboard_snapshot, tasks)
     recommended_now = dashboard_recommendations or task_recommendations(tasks) or (_current_recommendations() if _task_table_empty() else [])
     headline = dashboard_packet_headline(dashboard_snapshot, dashboard_recommendations)
+    today_packet = dashboard_packet_identity(latest_snapshot)
+    if today_packet:
+        today_packet["fresh"] = dashboard_snapshot is not None
 
     return {
         "source_of_truth": "Fresh Watson evidence-first dashboard packet first; canonical Memory Task rows are fallback; task-current captures are fallback only when the Task table is empty. All paths honor Memory attention state and Watson task dispositions.",
@@ -1246,7 +1251,7 @@ def get_summary() -> dict:
         "reconciliation_cadence": get_reconciliation_cadence(),
         "headline": headline,
         "summary": headline.get("summary") if headline else None,
-        "today_packet": dashboard_packet_identity(dashboard_snapshot),
+        "today_packet": today_packet,
         "recommended_now": recommended_now,
         "projects": [{"id": p["@id"], "title": p["title"], "status": p["status"], "priority": p["priority"]} for p in projects],
         "open_tasks": [
