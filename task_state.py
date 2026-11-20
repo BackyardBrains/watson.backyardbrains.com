@@ -50,6 +50,22 @@ def stable_task_key(project: str | None, task_id_or_description: str | None) -> 
     return f"{project_slug(project)}:{slugify(task_id_or_description or '')}"
 
 
+TASK_KEY_SHAPE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def answer_task_key(project: str | None, item_id: str | None) -> str:
+    """Key for an answer that names an item by the id Watson handed out.
+
+    Dashboard rows without a Memory task carry their task key as the id, so a
+    client sends that key straight back. Re-slugging it would prefix the project
+    twice and the answer would never match the row again.
+    """
+    raw = str(item_id or "").strip()
+    if TASK_KEY_SHAPE_RE.fullmatch(raw):
+        return raw
+    return stable_task_key(project, raw)
+
+
 def source_fingerprint(source_pointer: str | None, description: str | None = None) -> str | None:
     material = "\n".join((str(source_pointer or "").strip(), str(description or "").strip())).strip()
     if not material:
@@ -236,6 +252,32 @@ class TaskDispositionStore:
                 except ValueError:
                     return True
         return True
+
+    def clear(
+        self,
+        *,
+        task_key: str | None = None,
+        task_id: Any = None,
+        source_fingerprint_value: str | None = None,
+    ) -> int:
+        """Forget every disposition that would match this item (an undo)."""
+        clauses = []
+        params: list[Any] = []
+        if task_key:
+            clauses.append("task_key = ?")
+            params.append(task_key)
+        numeric_id = memory_task_numeric_id(task_id)
+        if numeric_id:
+            clauses.append("task_id = ?")
+            params.append(numeric_id)
+        if source_fingerprint_value:
+            clauses.append("source_fingerprint = ?")
+            params.append(source_fingerprint_value)
+        if not clauses:
+            return 0
+        with self._connect() as conn:
+            cursor = conn.execute(f"DELETE FROM task_dispositions WHERE {' OR '.join(clauses)}", params)
+            return cursor.rowcount
 
     def list(self, disposition: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 2000))

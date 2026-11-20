@@ -19,7 +19,7 @@ from capture_quality import (
     capture_key,
     classify_capture,
 )
-from task_state import TaskDispositionStore, source_fingerprint, stable_task_key
+from task_state import TaskDispositionStore, answer_task_key, source_fingerprint, stable_task_key
 
 MEMORY_API_URL = os.environ.get("MEMORY_API_URL", "https://memory.backyardbrains.com")
 MEMORY_API_KEY = os.environ.get("MEMORY_API_KEY", "")
@@ -64,7 +64,10 @@ TASK_STATUS_ALIASES = {
     "canceled": "dropped",
 }
 CLOSED_TASK_STATUSES = {"done", "dropped"}
+OPEN_TASK_STATUSES = {"open", "in_progress", "blocked"}
 TODAY_SUPPRESSING_DISPOSITIONS = {"done", "wont_do", "wrong", "snoozed", "deferred", "not_today"}
+# New evidence reopens a closed answer; it does not cut a snooze short.
+EVIDENCE_REOPENED_DISPOSITIONS = {"done", "wont_do", "wrong"}
 PRIORITY_RANKS = {"high": 1, "red": 1, "critical": 1, "medium": 2, "orange": 2, "normal": 2, "low": 3, "yellow": 3}
 GREG_OWNER_ALIASES = {"", "greg", "greg gage", "gagegreg", "you"}
 OPEN_PROJECT_STATES = {"active", "open", "pending"}
@@ -117,6 +120,9 @@ CLEAN_ACTION_PREFIX_RE = re.compile(
 MAX_TODAY_RECOMMENDATIONS = 5
 MAX_TODAY_ACTION_CHARS = 150
 MAX_DASHBOARD_PACKET_AGE_HOURS = 36
+MAX_FALLBACK_OVERDUE_DAYS = 14
+GREG_VIA_CORTEX_SOURCE = "cortex-board"
+FOLLOW_UP_OWNER = "watson"
 PROJECT_SLUG_OVERRIDES = {
     "BYB BizOps": "byb-ops",
     "BYB Business Operations": "byb-ops",
@@ -906,15 +912,15 @@ def get_projects(state: str | None = None, include_closed: bool = False) -> list
             "title": p.get("title") or p["slug"],
             "status": p.get("status") or "",
             "priority": p.get("priority") or "",
+            # Without this the row falls back to guessing lifecycle from status
+            # prose, and "PR merged" or "meeting canceled" hides a live project.
+            "lifecycle_state": p.get("lifecycle_state") or "active",
             "status_source": "project row",
         })
     return filter_projects(projects, state=state, include_closed=include_closed)
 
 
-def _task_limit(limit: int, include_complete: bool) -> int:
-    # The API can return closed/superseded tasks even when include_complete=false.
-    # Over-fetch so local filtering still returns enough current tasks.
-    return min(200, max(limit, limit * 4)) if not include_complete else limit
+MEMORY_TASK_PAGE_LIMIT = 200
 
 
 def _memory_tasks(params: dict | None = None) -> list[dict[str, Any]]:
@@ -926,6 +932,19 @@ def _memory_tasks(params: dict | None = None) -> list[dict[str, Any]]:
 
 def _task_table_empty() -> bool:
     return len(_memory_tasks({"include_complete": True, "limit": 1})) == 0
+
+
+def _memory_task_by_id(task_id: Any) -> dict[str, Any] | None:
+    numeric = _memory_task_ref(task_id)
+    if not numeric:
+        return None
+    try:
+        row = _get(f"/v1/tasks/{numeric}")
+    except Exception:
+        return None
+    if not isinstance(row, dict) or row.get("id") is None:
+        return None
+    return normalize_task({"@id": f"byb:task/{row['id']}", **row})
 
 
 def _apply_task_filters(
@@ -949,15 +968,24 @@ def _apply_task_filters(
 def get_tasks(project: str | None = None, status: str | None = None, include_complete: bool = True, limit: int = 50) -> list[dict]:
     table_probe = _memory_tasks({"include_complete": True, "limit": 1})
     table_has_rows = bool(table_probe)
-    params: dict = {"include_complete": include_complete, "limit": _task_limit(limit, include_complete)}
+    status_norm = normalize_task_status(status) if status else None
+    open_only = not include_complete or status_norm in OPEN_TASK_STATUSES
+    if open_only:
+        # Memory matches status as a raw substring and rows mix two vocabularies
+        # ("open" and "To Do"), so an upstream status filter drops most open rows.
+        # Fetch every open row and let normalize_task_status decide locally.
+        params: dict = {"include_complete": False, "limit": MEMORY_TASK_PAGE_LIMIT}
+    else:
+        params = {"include_complete": include_complete, "limit": limit}
+        if status_norm:
+            params["status"] = status_norm
     if project:
         params["project_slug"] = project.replace("byb:project/", "")
-    if status:
-        params["status"] = normalize_task_status(status)
-    elif not include_complete:
-        params["status"] = "open"
     if table_has_rows:
-        filtered = _apply_task_filters(_memory_tasks(params), project=project, status=status, include_complete=include_complete)
+        rows = _memory_tasks(params)
+        if open_only:
+            rows.sort(key=lambda task: int(task.get("id") or 0), reverse=True)
+        filtered = _apply_task_filters(rows, project=project, status=status, include_complete=include_complete)
         return [_apply_task_disposition_overlay(task) for task in filtered[:limit]]
 
     current = _current_tasks(limit=limit)
@@ -1050,23 +1078,41 @@ def _dashboard_action_text(item: dict[str, Any]) -> str:
     return re.sub(r"\s+\(Task\s+\d+\)\s*$", "", text, flags=re.IGNORECASE).strip()
 
 
-def _dashboard_action_is_today_item(item: dict[str, Any], block_title: str) -> bool:
-    label = _dashboard_action_text(item)
-    detail = _string_field(item, "detail", "description", "evidence")
+def _dashboard_action_is_red_item(item: dict[str, Any], block_title: str) -> bool:
     kind = str(item.get("kind") or "act").strip().lower()
     priority = str(item.get("priority") or "").strip().lower()
     title = block_title.lower()
-    if not label:
-        return False
-    if NO_TODAY_ACTION_RE.search(label) or (NO_TODAY_ACTION_RE.search(detail) and not re.search(r"\b(?:send|check|reply|decide|choose|approve)\b", label, re.I)):
+    if not _dashboard_action_text(item):
         return False
     if kind not in {"act", "action", "decision"}:
         return False
     return priority in {"red", "high", "critical"} or "red" in title or "top 3" in title
 
 
+def _dashboard_action_is_today_item(item: dict[str, Any], block_title: str) -> bool:
+    if not _dashboard_action_is_red_item(item, block_title):
+        return False
+    # Only the label can rule an item out. The detail is free prose, and a
+    # sentence like "two pings already sent with no action" used to drop a real
+    # Red item without telling anyone.
+    return not NO_TODAY_ACTION_RE.search(_dashboard_action_text(item))
+
+
 def _task_id_key(value: Any) -> str:
     return re.sub(r"\D+", "", str(value or "")) or str(value or "")
+
+
+MEMORY_TASK_REF_RE = re.compile(r"(?:byb:task/|task\s*|t|#)?(\d+)", re.IGNORECASE)
+
+
+def _memory_task_ref(value: Any) -> str | None:
+    """Numeric Memory task id, only when the value plainly is one.
+
+    A task key such as "family:pay-invoices-2752" also ends in digits and must
+    not be mistaken for task 2752.
+    """
+    match = MEMORY_TASK_REF_RE.fullmatch(str(value if value is not None else "").strip())
+    return match.group(1) if match else None
 
 
 def _tasks_by_id(tasks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1079,35 +1125,114 @@ def _tasks_by_id(tasks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return by_id
 
 
-def _dashboard_item_suppression(item: dict[str, Any], tasks_by_id: dict[str, dict[str, Any]]) -> str | None:
+def _evidence_capture_ids(item: dict[str, Any]) -> list[int]:
+    raw = item.get("evidence")
+    values = raw if isinstance(raw, list) else [raw]
+    ids: list[int] = []
+    for value in values:
+        ids.extend(int(match) for match in re.findall(r"(?<![\w.])\d{5,7}(?![\w.])", str(value or "")))
+    return ids
+
+
+def _answer_day(record: dict[str, Any]) -> date | None:
+    stamp = _parse_iso(record.get("updated_at"))
+    return stamp.astimezone(ZoneInfo("America/Detroit")).date() if stamp else None
+
+
+def _disposition_verdict(record: dict[str, Any] | None, item: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Decide whether a saved answer still hides a dashboard item.
+
+    Returns (hidden_reason, reopened_note); at most one of them is set.
+    """
+    if not record:
+        return None, None
+    disposition = str(record.get("disposition") or "")
+    if disposition not in TODAY_SUPPRESSING_DISPOSITIONS:
+        return None, None
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    answered_on = _answer_day(record)
+    when = f" on {answered_on.isoformat()}" if answered_on else ""
+    if disposition == "snoozed":
+        snooze_until = metadata.get("snooze_until_date")
+        until = _parse_date(snooze_until)
+        if until and until <= _local_today():
+            return None, None
+        return (f"snoozed until {snooze_until}" if snooze_until else "snoozed"), None
+    if disposition == "not_today":
+        if answered_on and answered_on < _local_today():
+            return None, None
+        return "not today", None
+    label = "answered" if metadata.get("answered") else disposition.replace("_", " ")
+    if disposition in EVIDENCE_REOPENED_DISPOSITIONS:
+        watermark = metadata.get("evidence_watermark")
+        if isinstance(watermark, int) and not isinstance(watermark, bool):
+            newer = sorted(capture_id for capture_id in _evidence_capture_ids(item) if capture_id > watermark)
+            if newer:
+                cited = ", ".join(str(capture_id) for capture_id in newer)
+                return None, f"New evidence ({cited}) since this was {label}{when}"
+    return f"{label}{when}", None
+
+
+def _dashboard_item_verdict(item: dict[str, Any], tasks_by_id: dict[str, dict[str, Any]]) -> tuple[str | None, str | None]:
     task_id = item.get("task_id") or item.get("taskId")
-    task = tasks_by_id.get(_task_id_key(task_id))
+    task_ref = _memory_task_ref(task_id)
+    task = tasks_by_id.get(task_ref) if task_ref else None
+    if task is None and task_ref:
+        # The lookup only holds open rows, so a task someone already closed in
+        # Memory has to be fetched to be seen as closed.
+        task = _memory_task_by_id(task_id)
     if task:
+        if not _is_open_task(task):
+            return f"task {task.get('id')} is {normalize_task_status(task.get('status'))}", None
         suppression = task_today_suppression(task)
         if suppression:
-            return suppression
+            return suppression, None
     label = _dashboard_action_text(item)
     project = canonical_project_slug(_string_field(item, "project") or "general")
     task_key = stable_task_key(project, str(task_id or label))
     fingerprint = source_fingerprint(_string_field(item, "action_url", "source_pointer", "url"), label)
-    if TASK_DISPOSITION_STORE.is_suppressed(
+    record = TASK_DISPOSITION_STORE.disposition_for(
         task_key=task_key,
-        task_id=task_id,
+        task_id=task_ref,
         source_fingerprint_value=fingerprint,
-    ):
-        return "task disposition"
-    return None
+    )
+    return _disposition_verdict(record, item)
+
+
+def _dashboard_item_suppression(item: dict[str, Any], tasks_by_id: dict[str, dict[str, Any]]) -> str | None:
+    return _dashboard_item_verdict(item, tasks_by_id)[0]
 
 
 def dashboard_action_recommendations(
     snapshot: dict[str, Any] | None,
     tasks: list[dict[str, Any]],
     limit: int = MAX_TODAY_RECOMMENDATIONS,
+    hidden: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Red items from the fresh dashboard packet that still need Greg.
+
+    Every Red item left out is appended to `hidden` with the reason, so a
+    publisher reading the result back can see what happened to each one.
+    """
     if not dashboard_snapshot_is_fresh(snapshot):
         return []
     task_lookup = _tasks_by_id(tasks)
     rows: list[dict[str, Any]] = []
+
+    def note_hidden(item: dict[str, Any], reason: str) -> None:
+        if hidden is None:
+            return
+        task_id = item.get("task_id") or item.get("taskId")
+        action = _dashboard_action_text(item)
+        project = canonical_project_slug(_string_field(item, "project") or "general")
+        hidden.append({
+            "action": action,
+            "project": project,
+            "task_id": task_id,
+            "task_key": stable_task_key(project, str(task_id or action)),
+            "reason": reason,
+        })
+
     blocks = sorted(
         [block for block in _dashboard_blocks(snapshot) if block.get("type") == "actions"],
         key=lambda block: (0 if re.search(r"\b(?:top\s*3|red)\b", str(block.get("title") or ""), re.I) else 1),
@@ -1118,10 +1243,17 @@ def dashboard_action_recommendations(
         if not isinstance(items, list):
             continue
         for item in [candidate for candidate in items if isinstance(candidate, dict)]:
-            if not _dashboard_action_is_today_item(item, title):
+            if not _dashboard_action_is_red_item(item, title):
                 continue
-            suppression = _dashboard_item_suppression(item, task_lookup)
+            if not _dashboard_action_is_today_item(item, title):
+                note_hidden(item, "label reads as no action for Greg")
+                continue
+            suppression, reopened = _dashboard_item_verdict(item, task_lookup)
             if suppression:
+                note_hidden(item, suppression)
+                continue
+            if len(rows) >= limit:
+                note_hidden(item, f"over the Today limit of {limit}")
                 continue
             action = _dashboard_action_text(item)
             task_id = item.get("task_id") or item.get("taskId")
@@ -1140,13 +1272,11 @@ def dashboard_action_recommendations(
                 "source_pointer": source_pointer,
                 "action_url": source_pointer,
                 "rank_reason": _string_field(item, "evidence", "detail"),
-                "reason": "Watson evidence-first dashboard packet",
+                "reason": reopened or "Watson evidence-first dashboard packet",
                 "effort": _string_field(item, "effort") or None,
                 "evidence": _string_field(item, "evidence") or None,
                 "dashboard_block": title,
             })
-            if len(rows) >= limit:
-                return rows
     return rows
 
 
@@ -1204,12 +1334,16 @@ def dashboard_packet_headline(snapshot: dict[str, Any] | None, recommendations: 
 
 def get_summary() -> dict:
     projects = get_projects()
-    tasks = get_tasks(include_complete=False, limit=15)
+    open_tasks = get_tasks(include_complete=False, limit=MEMORY_TASK_PAGE_LIMIT)
+    tasks = open_tasks[:15]
     today = datetime.now().strftime("%Y-%m-%d")
     events = get_events(from_date=today, limit=10)
     dashboard_snapshot = latest_watson_dashboard_snapshot()
-    dashboard_recommendations = dashboard_action_recommendations(dashboard_snapshot, tasks)
-    recommended_now = dashboard_recommendations or task_recommendations(tasks) or (_current_recommendations() if _task_table_empty() else [])
+    hidden_now: list[dict[str, Any]] = []
+    dashboard_recommendations = dashboard_action_recommendations(dashboard_snapshot, open_tasks, hidden=hidden_now)
+    recommended_now = dashboard_recommendations
+    if not recommended_now:
+        recommended_now = task_recommendations(open_tasks, hidden=hidden_now) or (_current_recommendations() if _task_table_empty() else [])
     headline = dashboard_packet_headline(dashboard_snapshot, dashboard_recommendations)
 
     return {
@@ -1220,6 +1354,7 @@ def get_summary() -> dict:
         "summary": headline.get("summary") if headline else None,
         "today_packet": dashboard_packet_identity(dashboard_snapshot),
         "recommended_now": recommended_now,
+        "hidden_now": hidden_now,
         "projects": [{"id": p["@id"], "title": p["title"], "status": p["status"], "priority": p["priority"]} for p in projects],
         "open_tasks": [
             {"id": t.get("@id"), "description": t.get("description"), "status": t.get("status"), "dueDate": t.get("dueDate"), "partOf": t.get("partOf")}
@@ -1229,12 +1364,33 @@ def get_summary() -> dict:
     }
 
 
-def task_recommendations(tasks: list[dict[str, Any]], limit: int = MAX_TODAY_RECOMMENDATIONS) -> list[dict[str, Any]]:
+def _long_past_due(task: dict[str, Any]) -> bool:
+    due = _parse_date(task.get("dueDate") or task.get("due_date") or task.get("due"))
+    return bool(due and (_local_today() - due).days > MAX_FALLBACK_OVERDUE_DAYS)
+
+
+def task_recommendations(
+    tasks: list[dict[str, Any]],
+    limit: int = MAX_TODAY_RECOMMENDATIONS,
+    hidden: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     candidates: list[tuple[tuple[int, str, str], dict[str, Any], str, str]] = []
     for task in tasks:
         description = strip_canonical_task_metadata(str(task.get("description") or ""))
         action = task_action_text(description)
         if not task_is_today_candidate(task, action):
+            continue
+        if _long_past_due(task):
+            # A row nobody closed months ago is not today's priority; ranking it
+            # first by "most overdue" is how June tasks ended up on Today.
+            if hidden is not None:
+                hidden.append({
+                    "action": action,
+                    "project": task.get("project") or str(task.get("partOf") or "").replace("byb:project/", ""),
+                    "task_id": task.get("id"),
+                    "task_key": task.get("task_key"),
+                    "reason": f"more than {MAX_FALLBACK_OVERDUE_DAYS} days past due; needs triage",
+                })
             continue
         candidates.append((today_priority_score(task, action), task, action, description))
 
@@ -1257,10 +1413,21 @@ def task_recommendations(tasks: list[dict[str, Any]], limit: int = MAX_TODAY_REC
     return recommendations
 
 
-def post_capture(content: str, source: str = "watson", project: str | None = None, sync: bool = True) -> dict:
+def post_capture(
+    content: str,
+    source: str = "watson",
+    project: str | None = None,
+    sync: bool = True,
+    visibility: str | None = None,
+) -> dict:
     raw = content
     if project:
         raw = f"[project: {project}] {raw}"
+    if visibility is None and source == GREG_VIA_CORTEX_SOURCE:
+        # Memory files this source as operational audit, which search leaves out
+        # by default. What Greg clicks or types in Cortex is an answer agents
+        # must be able to find, so it is stored as knowledge.
+        visibility = "knowledge"
     junk_reason = classify_capture({"raw_content": raw, "source": source})
     if junk_reason == "watson-sync-wrapper":
         return {
@@ -1269,9 +1436,12 @@ def post_capture(content: str, source: str = "watson", project: str | None = Non
             "reason": junk_reason,
             "message": "Skipped Watson sync wrapper. Memory captures must be concrete who/what/why facts, not run summaries.",
         }
+    body: dict[str, Any] = {"raw_content": raw, "source": source}
+    if visibility:
+        body["memory_visibility"] = visibility
     return _post(
         "/v1/captures",
-        {"raw_content": raw, "source": source},
+        body,
         params={"sync": "true"} if sync else None,
         timeout=60 if sync else 30,
     )
@@ -1389,3 +1559,180 @@ def record_task_disposition(
         source_fingerprint_value=normalized.get("source_fingerprint"),
         metadata={"memory_task": normalized.get("@id"), **(metadata or {})},
     )
+
+
+ANSWER_DISPOSITIONS = TODAY_SUPPRESSING_DISPOSITIONS | {"answered", "discuss", "reopen"}
+ANSWER_LABELS = {
+    "done": "marked done",
+    "wont_do": "marked won't do",
+    "wrong": "marked wrong",
+    "snoozed": "snoozed",
+    "deferred": "deferred",
+    "not_today": "marked not today",
+    "answered": "answered",
+    "discuss": "asked to discuss",
+    "reopen": "reopened",
+}
+
+
+def _latest_capture_id() -> int | None:
+    try:
+        rows = _get("/v1/search", {"q": "", "limit": 1})
+    except Exception:
+        return None
+    ids = [int(row.get("capture_id") or row.get("id") or 0) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    return max(ids) if ids and max(ids) > 0 else None
+
+
+def _project_row_id(project: str | None) -> int | None:
+    slug = canonical_project_slug(project)
+    try:
+        row = _get(f"/v1/projects/{slug}")
+    except Exception:
+        return None
+    return row.get("id") if isinstance(row, dict) else None
+
+
+def _find_answer_task(item_id: str, project: str | None) -> dict[str, Any] | None:
+    by_id = _memory_task_by_id(item_id)
+    if by_id:
+        return by_id
+    task_key = answer_task_key(project, item_id)
+    try:
+        open_tasks = get_tasks(include_complete=False, limit=MEMORY_TASK_PAGE_LIMIT)
+    except Exception:
+        return None
+    return next((task for task in open_tasks if str(task.get("task_key") or "") == task_key), None)
+
+
+def _answer_capture_text(*, actor: str, disposition: str, source: str, title: str, item_id: str, snooze_until: str | None, note: str | None) -> str:
+    via = "Cortex" if source == GREG_VIA_CORTEX_SOURCE else source
+    lines = [f"{actor} {ANSWER_LABELS[disposition]} via {via} on {_local_today().isoformat()}: {title} (task {item_id})"]
+    if snooze_until:
+        lines.append(f"Snooze until date: {snooze_until}")
+    if note:
+        lines.append(f"Note: {note}")
+    return "\n".join(lines)
+
+
+def record_task_answer(
+    *,
+    item_id: str,
+    disposition: str,
+    todo: dict[str, Any] | None = None,
+    reason: str | None = None,
+    note: str | None = None,
+    snooze_until: str | None = None,
+    actor: str = "Greg",
+    source: str = "dashboard",
+) -> dict[str, Any]:
+    """Apply one answer from Greg to a Today item so that it sticks.
+
+    The answer is saved as a searchable capture, written to the Memory task when
+    the item has one, and recorded as a disposition so the same item stays off
+    Today when the next dashboard packet repeats it. A decision ("answered") or
+    a comment ("discuss") also opens a follow-up task owned by Watson, because a
+    note alone has no owner and nobody acts on it.
+    """
+    if disposition not in ANSWER_DISPOSITIONS:
+        raise ValueError(f"Invalid disposition {disposition!r}; expected one of {sorted(ANSWER_DISPOSITIONS)}")
+    todo = todo or {}
+    item_id = str(item_id).strip()
+    project = str(todo.get("project") or todo.get("partOf") or "general")
+    title = str(todo.get("text") or todo.get("title") or todo.get("description") or item_id).strip()
+    source_pointer = todo.get("source_pointer") or todo.get("action_url") or None
+    task = _find_answer_task(item_id, project)
+    task_id = (task or {}).get("id")
+    task_key = answer_task_key(project, _memory_task_ref(item_id) or item_id)
+    fingerprint = (task or {}).get("source_fingerprint") or source_fingerprint(str(source_pointer or ""), title)
+
+    capture_id = None
+    capture_error = None
+    try:
+        capture = post_capture(
+            _answer_capture_text(actor=actor, disposition=disposition, source=source, title=title, item_id=item_id, snooze_until=snooze_until, note=note),
+            source=source,
+            project=canonical_project_slug(project),
+            sync=False,
+            visibility="knowledge",
+        )
+        capture_id = capture.get("capture_id") or capture.get("id")
+    except Exception as exc:  # the answer must still stick if Memory is slow
+        capture_error = str(exc)
+
+    status_result = None
+    if task_id is not None:
+        if disposition in {"done", "answered"}:
+            status_result = set_task_status(int(task_id), "done")
+        elif disposition in {"wrong", "wont_do"}:
+            status_result = set_task_status(int(task_id), "dropped")
+        elif disposition in {"snoozed", "deferred", "not_today"}:
+            attention_state = "deferred" if disposition == "deferred" else "snoozed"
+            status_result = set_task_attention(
+                int(task_id),
+                attention_state,
+                reason=reason,
+                snooze_until=(snooze_until or (_local_today() + timedelta(days=1)).isoformat()) if attention_state == "snoozed" else None,
+            )
+        elif disposition == "reopen":
+            set_task_status(int(task_id), "open")
+            status_result = set_task_attention(int(task_id), "active", reason=reason or "Reopened")
+
+    follow_up = None
+    if disposition in {"answered", "discuss"}:
+        lead = "Carry out Greg's decision" if disposition == "answered" else "Respond to Greg's comment"
+        body = f"{lead} on \"{title}\"."
+        if note:
+            body += f"\n{note}"
+        follow_up_key = f"{task_key}-{'decision' if disposition == 'answered' else 'comment'}-{capture_id or datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        created = create_task(
+            canonical_task_description(
+                description=body,
+                task_key=follow_up_key,
+                owner=FOLLOW_UP_OWNER,
+                priority="high",
+                source_pointer=str(source_pointer) if source_pointer else None,
+                source_capture_id=capture_id,
+            ),
+            status="To Do",
+            project_id=_project_row_id(project),
+        )
+        follow_up = {"id": created.get("id"), "task_key": follow_up_key, "owner": FOLLOW_UP_OWNER}
+
+    record = None
+    if disposition == "reopen":
+        TASK_DISPOSITION_STORE.clear(task_key=task_key, task_id=task_id, source_fingerprint_value=str(fingerprint or "") or None)
+    elif disposition != "discuss":
+        watermark = max([value for value in (int(capture_id) if capture_id else None, _latest_capture_id()) if value], default=None)
+        record = TASK_DISPOSITION_STORE.record(
+            task_key=task_key,
+            task_id=task_id,
+            disposition="done" if disposition == "answered" else disposition,
+            reason=reason or note,
+            actor=actor,
+            source=source,
+            project=project,
+            description=title,
+            source_pointer=str(source_pointer) if source_pointer else None,
+            source_fingerprint_value=str(fingerprint or "") or None,
+            metadata={
+                "dashboard_todo_id": item_id,
+                "memory_task": (task or {}).get("@id"),
+                "snooze_until_date": snooze_until,
+                "answered": disposition == "answered",
+                "answer_capture_id": capture_id,
+                "evidence_watermark": watermark,
+                "follow_up_task_id": (follow_up or {}).get("id"),
+            },
+        )
+    return {
+        "ok": True,
+        "task_key": task_key,
+        "memory_task": (task or {}).get("@id"),
+        "status_result": status_result,
+        "disposition": record,
+        "answer_capture_id": capture_id,
+        "answer_capture_error": capture_error,
+        "follow_up_task": follow_up,
+    }
+
