@@ -36,7 +36,9 @@ def today_local_date() -> datetime.date:
 
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
-    return slug[:96] or "task"
+    # Strip again after the cut so a slug never ends in "-" and slugging a slug
+    # gives the same slug back.
+    return slug[:96].strip("-") or "task"
 
 
 def project_slug(value: str | None) -> str:
@@ -50,9 +52,6 @@ def stable_task_key(project: str | None, task_id_or_description: str | None) -> 
     return f"{project_slug(project)}:{slugify(task_id_or_description or '')}"
 
 
-TASK_KEY_SHAPE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*")
-
-
 def answer_task_key(project: str | None, item_id: str | None) -> str:
     """Key for an answer that names an item by the id Watson handed out.
 
@@ -61,7 +60,8 @@ def answer_task_key(project: str | None, item_id: str | None) -> str:
     twice and the answer would never match the row again.
     """
     raw = str(item_id or "").strip()
-    if TASK_KEY_SHAPE_RE.fullmatch(raw):
+    head, separator, tail = raw.partition(":")
+    if separator and head and tail and f"{slugify(head)}:{slugify(tail)}" == raw:
         return raw
     return stable_task_key(project, raw)
 
@@ -156,7 +156,9 @@ class TaskDispositionStore:
         payload = {
             "task_key": task_key,
             "task_id": memory_task_numeric_id(task_id),
-            "source_fingerprint": source_fingerprint_value or source_fingerprint(source_pointer, description),
+            # No pointer, no fingerprint: a hash of the description alone would
+            # match the same wording in any other project.
+            "source_fingerprint": source_fingerprint_value or (source_fingerprint(source_pointer, description) if source_pointer else None),
             "disposition": disposition_norm,
             "reason": reason,
             "actor": actor,

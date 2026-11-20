@@ -20,8 +20,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+class NotFound(Exception):
+    """Shaped like httpx.HTTPStatusError for a 404."""
+
+    class response:  # noqa: N801
+        status_code = 404
+
+
 class FakeMemory:
     def __init__(self) -> None:
+        self.down: set[str] = set()  # path prefixes that fail as if Memory were unreachable
         self.tasks: dict[int, dict] = {}
         self.projects: dict[str, dict] = {}
         self.captures: list[dict] = []
@@ -36,8 +44,13 @@ class FakeMemory:
         self.tasks[task_id] = row
         return row
 
+    def _check_up(self, path: str) -> None:
+        if any(path.startswith(prefix) for prefix in self.down):
+            raise RuntimeError(f"Memory unreachable for {path}")
+
     def get(self, path: str, params: dict | None = None):
         params = params or {}
+        self._check_up(path)
         if path == "/v1/projects":
             state = params.get("state") or ("all" if params.get("include_closed") else "active")
             if state in {"all", "any"}:
@@ -46,7 +59,7 @@ class FakeMemory:
         if path.startswith("/v1/projects/"):
             slug = path.rsplit("/", 1)[1]
             if slug not in self.projects:
-                raise RuntimeError("404")
+                raise NotFound()
             return self.projects[slug]
         if path == "/v1/tasks":
             self.task_queries.append(dict(params))
@@ -59,8 +72,9 @@ class FakeMemory:
         if path.startswith("/v1/tasks/"):
             task_id = int(path.rsplit("/", 1)[1])
             if task_id not in self.tasks:
-                raise RuntimeError("404")
-            return self.tasks[task_id]
+                raise NotFound()
+            # The real endpoint returns the bare row, without the list-only fields.
+            return {key: value for key, value in self.tasks[task_id].items() if key not in {"partOf", "@id", "dueDate"}}
         if path == "/v1/agents/status/latest":
             return {"statuses": [self.snapshot] if self.snapshot else []}
         if path == "/v1/search":
@@ -70,6 +84,7 @@ class FakeMemory:
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, path: str, json: dict, params: dict | None = None, timeout: int = 30):
+        self._check_up(path)
         if path == "/v1/captures":
             capture = {"capture_id": self.next_capture_id, "id": self.next_capture_id, **json}
             self.next_capture_id += 1
@@ -83,6 +98,7 @@ class FakeMemory:
         raise AssertionError(f"unexpected POST {path}")
 
     def patch(self, url: str, headers=None, json=None, timeout=30):
+        self._check_up("/v1/tasks/")
         task_id = int(url.rsplit("/", 1)[1])
         self.tasks[task_id].update(json or {})
         row = self.tasks[task_id]
@@ -256,11 +272,133 @@ def main() -> int:
         assert memory.tasks[629]["status"] == "done", memory.tasks[629]
         actions, hidden = shown()
         assert actions != [nimh["label"]] and hidden[nimh["label"]] == "task 629 is done", (actions, hidden)
+        memory.snapshot = red_packet([{**nimh, "evidence": f"113300, {memory.next_capture_id + 40}"}])
+        summary = mc.get_summary()
+        assert [row["action"] for row in summary["recommended_now"]] == [nimh["label"]], "new evidence outranks the closed task"
+        assert summary["recommended_now"][0]["reason"].startswith("New evidence ("), summary["recommended_now"][0]
+        assert summary["recommended_now"][0]["id"].endswith(":629"), summary["recommended_now"][0]
         memory.add_task(630, "Follow up with David Donley", status="Done")  # closed by another agent, no answer saved
         donley = {"label": "Follow up with David Donley", "project": "spikestation-r25", "task_id": "630"}
         memory.snapshot = red_packet([donley])
         actions, hidden = shown()
         assert hidden.get(donley["label"]) == "task 630 is done", (actions, hidden)
+
+        # --- A row keeps its id when the row above it is answered and hidden.
+        first = {"label": "Sign the lease", "project": "byb-ops", "evidence": "113001"}
+        second = {"label": "Call the bank", "project": "byb-ops", "evidence": "113002"}
+        memory.snapshot = red_packet([first, second])
+        ids_before = {row["action"]: row["id"] for row in mc.get_summary()["recommended_now"]}
+        mc.record_task_answer(item_id="byb-ops:sign-the-lease", disposition="done", source="cortex-board",
+                              todo={"title": first["label"], "project": "byb-ops"})
+        ids_after = {row["action"]: row["id"] for row in mc.get_summary()["recommended_now"]}
+        assert ids_after == {second["label"]: ids_before[second["label"]]}, (ids_before, ids_after)
+        assert ids_before[first["label"]] != ids_before[second["label"]]
+
+        # --- The same wording in another project is a different item.
+        etienne_book = {"label": "Reply to Etienne", "project": "nsta-curriculum", "evidence": "113010"}
+        etienne_ops = {"label": "Reply to Etienne", "project": "byb-ops", "evidence": "113011"}
+        memory.snapshot = red_packet([etienne_book, etienne_ops])
+        mc.record_task_answer(item_id="nsta-curriculum:reply-to-etienne", disposition="done", source="cortex-board",
+                              todo={"title": "Reply to Etienne", "project": "nsta-curriculum"})
+        left = mc.get_summary()["recommended_now"]
+        assert [(row["project"], row["action"]) for row in left] == [("byb-ops", "Reply to Etienne")], left
+
+        # --- With a fresh packet, answering everything leaves Today empty. Task rows do not refill it.
+        memory.add_task(638, "Email MIT Press for the editor", status="To Do")
+        mc.record_task_answer(item_id="byb-ops:reply-to-etienne", disposition="done", source="cortex-board",
+                              todo={"title": "Reply to Etienne", "project": "byb-ops"})
+        summary = mc.get_summary()
+        assert summary["recommended_now"] == [], summary["recommended_now"]
+        assert summary["headline"]["title"].startswith("No Red Greg action"), summary["headline"]
+        del memory.tasks[638]
+
+        # --- A long label with a link still matches the key the row was given.
+        long_item = {"label": "Review " + "the revised specific aims page and budget justification " * 2 + "before Friday",
+                     "project": "nimh-grant", "action_url": "https://mail.google.com/mail/u/0/#inbox/abc", "evidence": "113020"}
+        memory.snapshot = red_packet([long_item])
+        long_row = mc.get_summary()["recommended_now"][0]
+        assert not long_row["task_key"].endswith("-"), long_row["task_key"]
+        mc.record_task_answer(item_id=long_row["task_key"], disposition="done", source="cortex-board",
+                              todo={"title": long_row["action"], "project": long_row["project"]})
+        assert mc.get_summary()["recommended_now"] == [], "Done on a long label must stick"
+
+        # --- A task id written as "T820" is task 820 on both sides.
+        memory.add_task(820, "Renew the IRB protocol", status="To Do")
+        irb = {"label": "Renew the IRB protocol", "project": "urop", "task_id": "T820", "evidence": "113030"}
+        memory.snapshot = red_packet([irb])
+        irb_row = mc.get_summary()["recommended_now"][0]
+        assert irb_row["task_key"] == "urop:820" and irb_row["id"].endswith(":820"), irb_row
+        mc.record_task_answer(item_id="T820", disposition="done", source="cortex-board", todo={"title": irb["label"], "project": "urop"})
+        assert memory.tasks[820]["status"] == "done"
+        memory.down = {"/v1/tasks/820"}  # even if the task cannot be read, the saved answer hides it
+        mc._closed_task_memo.clear()
+        assert mc.get_summary()["recommended_now"] == []
+        memory.down = set()
+
+        # --- Only capture ids count as evidence, and what the item cited when answered never reopens it.
+        assert mc._evidence_capture_ids({"evidence": "113040; INV-204518, #1054321, $250000, Memory 113564, capture:113565 (113566)."}) == [113040, 113564, 113565, 113566]
+        assert mc._evidence_capture_ids({"evidence": [113698, "113678"]}) == [113698, 113678]
+        assert mc._evidence_capture_ids({"evidence": None}) == []
+        invoice = {"label": "Pay the framing invoice", "project": "byb-ops", "evidence": "113040; INV-204518, #1054321, $250000"}
+        memory.snapshot = red_packet([invoice])
+        mc.record_task_answer(item_id="byb-ops:pay-the-framing-invoice", disposition="done", source="cortex-board",
+                              todo={"title": invoice["label"], "project": "byb-ops"})
+        assert mc.get_summary()["recommended_now"] == [], "numbers that are not capture ids must not reopen an item"
+        future_id = memory.next_capture_id + 500
+        cited_early = {"label": "Approve the poster proof", "project": "sfn-2026", "evidence": f"113050, {future_id}"}
+        memory.snapshot = red_packet([cited_early])
+        mc.record_task_answer(item_id="sfn-2026:approve-the-poster-proof", disposition="done", source="cortex-board",
+                              todo={"title": cited_early["label"], "project": "sfn-2026"})
+        assert mc.get_summary()["recommended_now"] == [], "evidence the item already cited when answered is not new"
+
+        # --- If the follow-up cannot be opened, nothing else changes, and the retry completes.
+        memory.add_task(830, "Decide the booth size", status="To Do")
+        booth = {"label": "Decide the booth size", "project": "sfn-2026", "task_id": 830, "evidence": "113060"}
+        memory.snapshot = red_packet([booth])
+        real_post = memory.post
+
+        def failing_post(path, json, params=None, timeout=30):
+            if path == "/v1/tasks":
+                raise RuntimeError("Memory refused the new task")
+            return real_post(path, json, params, timeout)
+
+        mc._post = failing_post
+        try:
+            mc.record_task_answer(item_id="830", disposition="answered", note="Answer: 10x10.", source="cortex-board",
+                                  todo={"title": booth["label"], "project": "sfn-2026"})
+            raise AssertionError("a failed follow-up must fail the answer")
+        except RuntimeError:
+            pass
+        assert memory.tasks[830]["status"] == "To Do", "the decision task must stay open when its follow-up was not created"
+        assert [row["action"] for row in mc.get_summary()["recommended_now"]] == [booth["label"]]
+        mc._post = memory.post
+        retried = mc.record_task_answer(item_id="830", disposition="answered", note="Answer: 10x10.", source="cortex-board",
+                                        todo={"title": booth["label"], "project": "sfn-2026"})
+        assert memory.tasks[830]["status"] == "done" and retried["follow_up_task"]["id"] in memory.tasks
+
+        # --- An undo that cannot reach Memory fails loudly instead of claiming success.
+        memory.down = {"/v1/tasks/830"}
+        try:
+            mc.record_task_answer(item_id="830", disposition="reopen", source="cortex-board", todo={"title": booth["label"], "project": "sfn-2026"})
+            raise AssertionError("reopen must not report success when Memory cannot be read")
+        except RuntimeError:
+            pass
+        memory.down = set()
+        mc.record_task_answer(item_id="830", disposition="reopen", source="cortex-board", todo={"title": booth["label"], "project": "sfn-2026"})
+        assert memory.tasks[830]["status"] == "open"
+        assert [row["action"] for row in mc.get_summary()["recommended_now"]] == [booth["label"]]
+
+        # --- Undo reopens a Memory task that Done closed through a key match.
+        memory.add_task(840, "Order the banner", status="To Do", partOf="byb:project/sfn-2026")
+        banner = {"label": "Order the banner", "project": "sfn-2026", "evidence": "113070"}
+        memory.snapshot = red_packet([banner])
+        mc.record_task_answer(item_id="sfn-2026:order-the-banner", disposition="done", source="cortex-board",
+                              todo={"title": banner["label"], "project": "sfn-2026"})
+        assert memory.tasks[840]["status"] == "done", "Done on a label that names an open task closes that task"
+        mc.record_task_answer(item_id="sfn-2026:order-the-banner", disposition="reopen", source="cortex-board",
+                              todo={"title": banner["label"], "project": "sfn-2026"})
+        assert memory.tasks[840]["status"] == "open", memory.tasks[840]
+        assert [row["action"] for row in mc.get_summary()["recommended_now"]] == [banner["label"]]
 
         # --- Labels that say "no action" are left out, and reported.
         memory.snapshot = red_packet([{"label": "FYI: HHD wire is waiting on BofA", "project": "spikerbot-ks"}])

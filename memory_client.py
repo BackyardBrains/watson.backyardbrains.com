@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -935,17 +936,45 @@ def _task_table_empty() -> bool:
     return len(_memory_tasks({"include_complete": True, "limit": 1})) == 0
 
 
-def _memory_task_by_id(task_id: Any) -> dict[str, Any] | None:
+CLOSED_TASK_MEMO_SECONDS = 300
+_closed_task_memo: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _memory_task_by_id(task_id: Any, *, strict: bool = False) -> dict[str, Any] | None:
+    """One Memory task by id, open or closed; None when there is no such task.
+
+    A failed lookup also returns None unless strict is set. Writers pass strict
+    so that "Memory did not answer" is never mistaken for "no such task".
+    """
     numeric = _memory_task_ref(task_id)
     if not numeric:
         return None
     try:
         row = _get(f"/v1/tasks/{numeric}")
-    except Exception:
+    except Exception as exc:
+        if strict and getattr(getattr(exc, "response", None), "status_code", None) != 404:
+            raise
         return None
     if not isinstance(row, dict) or row.get("id") is None:
         return None
     return normalize_task({"@id": f"byb:task/{row['id']}", **row})
+
+
+def _closed_task_for_item(task_ref: str) -> dict[str, Any] | None:
+    """Look up a task the open list does not hold, remembering closed ones briefly.
+
+    Today is polled every minute; without this each Red item tied to a closed
+    task costs one Memory request per poll. A task that reopens shows up in the
+    open list, which is consulted first, so a remembered closed row cannot mask it.
+    """
+    now = time.monotonic()
+    remembered = _closed_task_memo.get(task_ref)
+    if remembered and now - remembered[0] < CLOSED_TASK_MEMO_SECONDS:
+        return remembered[1]
+    task = _memory_task_by_id(task_ref)
+    if task and not _is_open_task(task):
+        _closed_task_memo[task_ref] = (now, task)
+    return task
 
 
 def get_task(task_id: Any) -> dict[str, Any] | None:
@@ -1131,12 +1160,21 @@ def _tasks_by_id(tasks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return by_id
 
 
+# A capture id in an evidence field: a bare number in a list ("113698, 113678"),
+# optionally introduced by "capture" or "Memory". Numbers glued to other marks
+# ("INV-204518", "#1054321", "$250000") are not capture ids.
+EVIDENCE_CAPTURE_ID_RE = re.compile(
+    r"(?:^|(?<=[\s,;(\[]))(?:(?:capture|memory)\s*[:#]?\s*)?(\d{5,7})(?=$|[\s,;.)\]])",
+    re.IGNORECASE,
+)
+
+
 def _evidence_capture_ids(item: dict[str, Any]) -> list[int]:
     raw = item.get("evidence")
     values = raw if isinstance(raw, list) else [raw]
     ids: list[int] = []
     for value in values:
-        ids.extend(int(match) for match in re.findall(r"(?<![\w.])\d{5,7}(?![\w.])", str(value or "")))
+        ids.extend(int(match) for match in EVIDENCE_CAPTURE_ID_RE.findall(str(value if value is not None else "")))
     return ids
 
 
@@ -1172,37 +1210,65 @@ def _disposition_verdict(record: dict[str, Any] | None, item: dict[str, Any]) ->
     if disposition in EVIDENCE_REOPENED_DISPOSITIONS:
         watermark = metadata.get("evidence_watermark")
         if isinstance(watermark, int) and not isinstance(watermark, bool):
-            newer = sorted(capture_id for capture_id in _evidence_capture_ids(item) if capture_id > watermark)
+            seen = {int(value) for value in metadata.get("evidence_seen") or [] if str(value).isdigit()}
+            newer = sorted(capture_id for capture_id in _evidence_capture_ids(item) if capture_id > watermark and capture_id not in seen)
             if newer:
                 cited = ", ".join(str(capture_id) for capture_id in newer)
                 return None, f"New evidence ({cited}) since this was {label}{when}"
     return f"{label}{when}", None
 
 
-def _dashboard_item_verdict(item: dict[str, Any], tasks_by_id: dict[str, dict[str, Any]]) -> tuple[str | None, str | None]:
+def _pointer_fingerprint(source_pointer: Any, label: str) -> str | None:
+    """Fingerprint for matching an answer to an item, only when the item links somewhere.
+
+    Without a link the fingerprint would be the label alone, and "Reply to
+    Etienne" in one project would answer "Reply to Etienne" in another.
+    """
+    pointer = str(source_pointer or "").strip()
+    return source_fingerprint(pointer, label) if pointer else None
+
+
+def _dashboard_item_identity(item: dict[str, Any]) -> dict[str, Any]:
     task_id = item.get("task_id") or item.get("taskId")
     task_ref = _memory_task_ref(task_id)
+    label = _dashboard_action_text(item)
+    project = canonical_project_slug(_string_field(item, "project") or "general")
+    source_pointer = _string_field(item, "action_url", "source_pointer", "url") or None
+    return {
+        "task_id": task_id,
+        "task_ref": task_ref,
+        "label": label,
+        "project": project,
+        "source_pointer": source_pointer,
+        "task_key": stable_task_key(project, str(task_ref or task_id or label)),
+        "fingerprint": _pointer_fingerprint(source_pointer, label),
+    }
+
+
+def _dashboard_item_verdict(item: dict[str, Any], tasks_by_id: dict[str, dict[str, Any]]) -> tuple[str | None, str | None]:
+    identity = _dashboard_item_identity(item)
+    task_ref = identity["task_ref"]
+    record = TASK_DISPOSITION_STORE.disposition_for(
+        task_key=identity["task_key"],
+        task_id=task_ref,
+        source_fingerprint_value=identity["fingerprint"],
+    )
+    hidden_by_answer, reopened = _disposition_verdict(record, item)
     task = tasks_by_id.get(task_ref) if task_ref else None
     if task is None and task_ref:
         # The lookup only holds open rows, so a task someone already closed in
         # Memory has to be fetched to be seen as closed.
-        task = _memory_task_by_id(task_id)
+        task = _closed_task_for_item(task_ref)
     if task:
         if not _is_open_task(task):
+            # Evidence newer than Greg's answer outranks the closed task.
+            if reopened:
+                return None, reopened
             return f"task {task.get('id')} is {normalize_task_status(task.get('status'))}", None
         suppression = task_today_suppression(task)
         if suppression:
             return suppression, None
-    label = _dashboard_action_text(item)
-    project = canonical_project_slug(_string_field(item, "project") or "general")
-    task_key = stable_task_key(project, str(task_id or label))
-    fingerprint = source_fingerprint(_string_field(item, "action_url", "source_pointer", "url"), label)
-    record = TASK_DISPOSITION_STORE.disposition_for(
-        task_key=task_key,
-        task_id=task_ref,
-        source_fingerprint_value=fingerprint,
-    )
-    return _disposition_verdict(record, item)
+    return hidden_by_answer, reopened
 
 
 def _dashboard_item_suppression(item: dict[str, Any], tasks_by_id: dict[str, dict[str, Any]]) -> str | None:
@@ -1228,14 +1294,12 @@ def dashboard_action_recommendations(
     def note_hidden(item: dict[str, Any], reason: str) -> None:
         if hidden is None:
             return
-        task_id = item.get("task_id") or item.get("taskId")
-        action = _dashboard_action_text(item)
-        project = canonical_project_slug(_string_field(item, "project") or "general")
+        identity = _dashboard_item_identity(item)
         hidden.append({
-            "action": action,
-            "project": project,
-            "task_id": task_id,
-            "task_key": stable_task_key(project, str(task_id or action)),
+            "action": identity["label"],
+            "project": identity["project"],
+            "task_id": identity["task_id"],
+            "task_key": identity["task_key"],
             "reason": reason,
         })
 
@@ -1261,15 +1325,20 @@ def dashboard_action_recommendations(
             if len(rows) >= limit:
                 note_hidden(item, f"over the Today limit of {limit}")
                 continue
-            action = _dashboard_action_text(item)
-            task_id = item.get("task_id") or item.get("taskId")
-            project = canonical_project_slug(_string_field(item, "project") or "general")
-            source_pointer = _string_field(item, "action_url", "source_pointer", "url") or None
+            identity = _dashboard_item_identity(item)
+            action = identity["label"]
+            task_id = identity["task_id"]
+            project = identity["project"]
+            source_pointer = identity["source_pointer"]
+            packet_version = snapshot.get("dashboard_version") or snapshot.get("generated_at") or "latest"
             rows.append({
                 "rank": len(rows) + 1,
-                "id": f"watson-dashboard:{snapshot.get('dashboard_version') or snapshot.get('generated_at') or 'latest'}:{task_id or len(rows) + 1}",
+                # The id names the item, not its position. Clients keep per-row
+                # state under it, and a position shifts as soon as the item
+                # above is answered and hidden.
+                "id": f"watson-dashboard:{packet_version}:{identity['task_ref'] or identity['task_key']}",
                 "task_id": task_id,
-                "task_key": stable_task_key(project, str(task_id or action)),
+                "task_key": identity["task_key"],
                 "project": project,
                 "action": action,
                 "description": _string_field(item, "detail", "description", "evidence") or action,
@@ -1348,7 +1417,10 @@ def get_summary() -> dict:
     hidden_now: list[dict[str, Any]] = []
     dashboard_recommendations = dashboard_action_recommendations(dashboard_snapshot, open_tasks, hidden=hidden_now)
     recommended_now = dashboard_recommendations
-    if not recommended_now:
+    if not recommended_now and not dashboard_snapshot_is_fresh(dashboard_snapshot):
+        # Task rows fill Today only when there is no fresh packet. With one, an
+        # empty list means Greg has answered everything in it; refilling from the
+        # task list puts near-copies of what he just answered back in front of him.
         recommended_now = task_recommendations(open_tasks, hidden=hidden_now) or (_current_recommendations() if _task_table_empty() else [])
     headline = dashboard_packet_headline(dashboard_snapshot, dashboard_recommendations)
 
@@ -1600,15 +1672,23 @@ def _project_row_id(project: str | None) -> int | None:
 
 
 def _find_answer_task(item_id: str, project: str | None) -> dict[str, Any] | None:
-    by_id = _memory_task_by_id(item_id)
+    """The Memory task an answer applies to. Raises if Memory cannot be asked."""
+    by_id = _memory_task_by_id(item_id, strict=True)
     if by_id:
         return by_id
     task_key = answer_task_key(project, item_id)
-    try:
-        open_tasks = get_tasks(include_complete=False, limit=MEMORY_TASK_PAGE_LIMIT)
-    except Exception:
-        return None
+    open_tasks = get_tasks(include_complete=False, limit=MEMORY_TASK_PAGE_LIMIT)
     return next((task for task in open_tasks if str(task.get("task_key") or "") == task_key), None)
+
+
+def _packet_item_for_key(task_key: str) -> dict[str, Any] | None:
+    """The item in the current dashboard packet that an answer names, if it is there."""
+    for block in _dashboard_blocks(latest_watson_dashboard_snapshot()):
+        items = block.get("items")
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and _dashboard_item_identity(item)["task_key"] == task_key:
+                return item
+    return None
 
 
 def _answer_capture_text(*, actor: str, disposition: str, source: str, title: str, item_id: str, snooze_until: str | None, note: str | None) -> str:
@@ -1653,10 +1733,16 @@ def record_task_answer(
     project = str(todo.get("project") or todo.get("partOf") or "general")
     title = str(todo.get("text") or todo.get("title") or todo.get("description") or item_id).strip()
     source_pointer = todo.get("source_pointer") or todo.get("action_url") or None
-    task = _find_answer_task(item_id, project)
-    task_id = (task or {}).get("id")
     task_key = answer_task_key(project, _memory_task_ref(item_id) or item_id)
-    fingerprint = (task or {}).get("source_fingerprint") or source_fingerprint(str(source_pointer or ""), title)
+    task = _find_answer_task(item_id, project)
+    existing = TASK_DISPOSITION_STORE.disposition_for(task_key=task_key)
+    if task is None and disposition == "reopen" and existing and existing.get("task_id"):
+        # Done on a label-only item can close a Memory task matched by key. That
+        # task is no longer in the open list, so the undo finds it through the
+        # answer it is undoing.
+        task = _memory_task_by_id(existing["task_id"], strict=True)
+    task_id = (task or {}).get("id")
+    fingerprint = (task or {}).get("source_fingerprint") or _pointer_fingerprint(source_pointer, title)
 
     capture_id = int(answer_capture_id) if answer_capture_id else None
     capture_error = None
@@ -1672,24 +1758,9 @@ def record_task_answer(
     except Exception as exc:  # the answer must still stick if Memory is slow
         capture_error = str(exc)
 
-    status_result = None
-    if task_id is not None:
-        if disposition in {"done", "answered"}:
-            status_result = set_task_status(int(task_id), "done")
-        elif disposition in {"wrong", "wont_do"}:
-            status_result = set_task_status(int(task_id), "dropped")
-        elif disposition in {"snoozed", "deferred", "not_today"}:
-            attention_state = "deferred" if disposition == "deferred" else "snoozed"
-            status_result = set_task_attention(
-                int(task_id),
-                attention_state,
-                reason=reason,
-                snooze_until=(snooze_until or (_local_today() + timedelta(days=1)).isoformat()) if attention_state == "snoozed" else None,
-            )
-        elif disposition == "reopen":
-            set_task_status(int(task_id), "open")
-            status_result = set_task_attention(int(task_id), "active", reason=reason or "Reopened")
-
+    # Order matters when a step fails: the follow-up comes first because it is
+    # found again on a retry, then the Memory task, and the disposition last so
+    # the item is hidden only once everything else is in place.
     follow_up = None
     if disposition in {"answered", "discuss"}:
         lead = "Carry out Greg's decision" if disposition == "answered" else "Respond to Greg's comment"
@@ -1717,6 +1788,25 @@ def record_task_answer(
         )
         follow_up = {"id": created.get("id"), "task_key": follow_up_key, "owner": FOLLOW_UP_OWNER}
 
+    status_result = None
+    if task_id is not None:
+        if disposition in {"done", "answered"}:
+            status_result = set_task_status(int(task_id), "done")
+        elif disposition in {"wrong", "wont_do"}:
+            status_result = set_task_status(int(task_id), "dropped")
+        elif disposition in {"snoozed", "deferred", "not_today"}:
+            attention_state = "deferred" if disposition == "deferred" else "snoozed"
+            status_result = set_task_attention(
+                int(task_id),
+                attention_state,
+                reason=reason,
+                snooze_until=(snooze_until or (_local_today() + timedelta(days=1)).isoformat()) if attention_state == "snoozed" else None,
+            )
+        elif disposition == "reopen":
+            set_task_status(int(task_id), "open")
+            status_result = set_task_attention(int(task_id), "active", reason=reason or "Reopened")
+        _closed_task_memo.pop(str(task_id), None)
+
     record = None
     if disposition == "reopen":
         TASK_DISPOSITION_STORE.clear(task_key=task_key, task_id=task_id, source_fingerprint_value=str(fingerprint or "") or None)
@@ -1725,6 +1815,9 @@ def record_task_answer(
             watermark = int(answer_capture_id)
         else:
             watermark = max([value for value in (int(capture_id) if capture_id else None, _latest_capture_id()) if value], default=None)
+        # Whatever the item cites right now is what Greg answered. Only evidence
+        # that appears later can bring it back.
+        packet_item = _packet_item_for_key(task_key)
         record = TASK_DISPOSITION_STORE.record(
             task_key=task_key,
             task_id=task_id,
@@ -1743,6 +1836,7 @@ def record_task_answer(
                 "answered": disposition == "answered",
                 "answer_capture_id": capture_id,
                 "evidence_watermark": watermark,
+                "evidence_seen": _evidence_capture_ids(packet_item) if packet_item else [],
                 "follow_up_task_id": (follow_up or {}).get("id"),
             },
             answered_at=answered_at,
