@@ -31,9 +31,6 @@ OPENCLAW_CRON_RUNS_DIR = Path(os.environ.get("OPENCLAW_CRON_RUNS_DIR", DATA_PATH
 HEADERS = {"X-API-Key": MEMORY_API_KEY, "Content-Type": "application/json"}
 QUALITY_STORE = CaptureQualityStore(QUALITY_DB_PATH)
 TASK_DISPOSITION_STORE = TaskDispositionStore()
-PROJECT_STATUS_RE = re.compile(
-    r"\[project-status-current\]\s+project=(?P<slug>[\w-]+)\s+priority=(?P<priority>\S+)\s+status=\"(?P<status>[^\"]+)\""
-)
 WHAT_NOW_RE = re.compile(
     r"\[what-now-current\]\s+rank=(?P<rank>\d+)(?:\s+id=\"[^\"]+\")?\s+project=\"(?P<project>[^\"]+)\"\s+action=\"(?P<action>[^\"]+)\"\s+effort=\"(?P<effort>[^\"]+)\"\s+reason=\"(?P<reason>[^\"]+)\""
 )
@@ -795,32 +792,6 @@ def list_capture_quality(status: str | None = None, limit: int = 100) -> list[di
     return QUALITY_STORE.list_records(status=status, limit=limit)
 
 
-def _project_status_overrides() -> dict[str, dict[str, str]]:
-    """Latest Memory captures can correct stale project rows until project PATCH exists."""
-    try:
-        captures = search_captures("project-status-current", limit=50)
-    except Exception:
-        return {}
-
-    overrides: dict[str, dict[str, str]] = {}
-    for capture in captures:
-        raw = str(capture.get("raw_content") or "")
-        match = PROJECT_STATUS_RE.search(raw)
-        if not match:
-            continue
-        slug = match.group("slug")
-        created_at = str(capture.get("created_at") or "")
-        existing = overrides.get(slug)
-        if existing and existing.get("created_at", "") > created_at:
-            continue
-        overrides[slug] = {
-            "status": match.group("status"),
-            "priority": match.group("priority"),
-            "created_at": created_at,
-        }
-    return overrides
-
-
 def _current_recommendations() -> list[dict[str, Any]]:
     try:
         # Empty q returns recent captures; filter exact tags locally so semantic
@@ -921,20 +892,21 @@ def get_projects(state: str | None = None, include_closed: bool = False) -> list
     if include_closed:
         params["include_closed"] = "true"
     raw = _get("/v1/projects", params)
-    overrides = _project_status_overrides()
+    # The Memory project row is canonical (kept current via PATCH /v1/projects).
+    # Legacy [project-status-current] captures no longer override it: they were
+    # a pre-PATCH stopgap and pinned July text over current rows for months.
     projects = []
     for p in raw:
         if not isinstance(p, dict) or not p.get("slug"):
             continue
-        override = overrides.get(str(p["slug"]), {})
         projects.append({
             "@id": f"byb:project/{p['slug']}",
             "id": p.get("id"),
             "slug": p["slug"],
             "title": p.get("title") or p["slug"],
-            "status": override.get("status", p.get("status") or ""),
-            "priority": override.get("priority", p.get("priority") or ""),
-            "status_source": "project-status-current capture" if override else "project row",
+            "status": p.get("status") or "",
+            "priority": p.get("priority") or "",
+            "status_source": "project row",
         })
     return filter_projects(projects, state=state, include_closed=include_closed)
 
