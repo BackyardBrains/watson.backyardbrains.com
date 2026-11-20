@@ -734,9 +734,9 @@ def set_task_disposition(
     _verify_private_key(privateKey)
     if not USE_MEMORY_API:
         raise ValueError("set_task_disposition requires USE_MEMORY_API=true")
-    from memory_client import get_tasks, record_task_disposition
-    tasks = get_tasks(include_complete=True, limit=1000)
-    task = next((item for item in tasks if str(item.get("id")) == str(task_id)), None)
+    from memory_client import get_task, record_task_disposition
+    # Looked up by id: the task list is capped at 200 rows and missed the rest.
+    task = get_task(task_id)
     if not task:
         raise ValueError(f"Task {task_id} not found")
     record = record_task_disposition(task=task, disposition=disposition, reason=reason or None)
@@ -1398,6 +1398,8 @@ class PlaygroundTaskFeedbackPayload(BaseModel):
     note: str | None = None
     actor: str | None = None
     source: str | None = None
+    answer_capture_id: int | None = None
+    answered_at: datetime | None = None
 
 
 def _normalize_dashboard_disposition(disposition: str) -> str:
@@ -1463,6 +1465,8 @@ def _record_task_answer(
     snooze_until: str | None,
     actor: str | None,
     source: str | None,
+    answer_capture_id: int | None = None,
+    answered_at: datetime | None = None,
 ) -> dict[str, Any]:
     if not USE_MEMORY_API:
         raise HTTPException(status_code=422, detail="task answers require USE_MEMORY_API=true")
@@ -1481,6 +1485,8 @@ def _record_task_answer(
         snooze_until=snooze_until,
         actor=(actor or "").strip() or "Greg",
         source=(source or "").strip() or "dashboard",
+        answer_capture_id=answer_capture_id,
+        answered_at=answered_at.isoformat() if answered_at else None,
     )
     capture_flag = None
     if disposition == "wrong":
@@ -1511,6 +1517,8 @@ def playground_task_feedback_post(
         snooze_until=payload.snooze_until,
         actor=payload.actor,
         source=payload.source,
+        answer_capture_id=payload.answer_capture_id,
+        answered_at=payload.answered_at,
     )
 
 

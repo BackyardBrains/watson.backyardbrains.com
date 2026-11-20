@@ -2,6 +2,7 @@
 Memory API client. Watson uses this when USE_MEMORY_API=true.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -947,6 +948,11 @@ def _memory_task_by_id(task_id: Any) -> dict[str, Any] | None:
     return normalize_task({"@id": f"byb:task/{row['id']}", **row})
 
 
+def get_task(task_id: Any) -> dict[str, Any] | None:
+    """One Memory task by id, open or closed."""
+    return _memory_task_by_id(task_id)
+
+
 def _apply_task_filters(
     tasks: list[dict[str, Any]],
     project: str | None = None,
@@ -1625,6 +1631,8 @@ def record_task_answer(
     snooze_until: str | None = None,
     actor: str = "Greg",
     source: str = "dashboard",
+    answer_capture_id: int | None = None,
+    answered_at: str | None = None,
 ) -> dict[str, Any]:
     """Apply one answer from Greg to a Today item so that it sticks.
 
@@ -1633,6 +1641,10 @@ def record_task_answer(
     Today when the next dashboard packet repeats it. A decision ("answered") or
     a comment ("discuss") also opens a follow-up task owned by Watson, because a
     note alone has no owner and nobody acts on it.
+
+    answer_capture_id and answered_at apply an answer that is already on record
+    as a capture (one given before answers were applied): no second capture is
+    written, and newer evidence is measured from that capture.
     """
     if disposition not in ANSWER_DISPOSITIONS:
         raise ValueError(f"Invalid disposition {disposition!r}; expected one of {sorted(ANSWER_DISPOSITIONS)}")
@@ -1646,10 +1658,10 @@ def record_task_answer(
     task_key = answer_task_key(project, _memory_task_ref(item_id) or item_id)
     fingerprint = (task or {}).get("source_fingerprint") or source_fingerprint(str(source_pointer or ""), title)
 
-    capture_id = None
+    capture_id = int(answer_capture_id) if answer_capture_id else None
     capture_error = None
     try:
-        capture = post_capture(
+        capture = {"capture_id": capture_id} if capture_id else post_capture(
             _answer_capture_text(actor=actor, disposition=disposition, source=source, title=title, item_id=item_id, snooze_until=snooze_until, note=note),
             source=source,
             project=canonical_project_slug(project),
@@ -1684,8 +1696,14 @@ def record_task_answer(
         body = f"{lead} on \"{title}\"."
         if note:
             body += f"\n{note}"
-        follow_up_key = f"{task_key}-{'decision' if disposition == 'answered' else 'comment'}-{capture_id or datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        created = create_task(
+        # Keyed by what Greg said, so a retried request finds the task it already
+        # opened and a different answer later opens a new one.
+        said = hashlib.sha256((note or "").encode("utf-8", errors="replace")).hexdigest()[:10]
+        follow_up_key = f"{task_key}-{'decision' if disposition == 'answered' else 'comment'}-{said}"
+        created = next(
+            (row for row in get_tasks(include_complete=False, limit=MEMORY_TASK_PAGE_LIMIT) if row.get("task_key") == follow_up_key),
+            None,
+        ) or create_task(
             canonical_task_description(
                 description=body,
                 task_key=follow_up_key,
@@ -1703,7 +1721,10 @@ def record_task_answer(
     if disposition == "reopen":
         TASK_DISPOSITION_STORE.clear(task_key=task_key, task_id=task_id, source_fingerprint_value=str(fingerprint or "") or None)
     elif disposition != "discuss":
-        watermark = max([value for value in (int(capture_id) if capture_id else None, _latest_capture_id()) if value], default=None)
+        if answer_capture_id:
+            watermark = int(answer_capture_id)
+        else:
+            watermark = max([value for value in (int(capture_id) if capture_id else None, _latest_capture_id()) if value], default=None)
         record = TASK_DISPOSITION_STORE.record(
             task_key=task_key,
             task_id=task_id,
@@ -1724,6 +1745,7 @@ def record_task_answer(
                 "evidence_watermark": watermark,
                 "follow_up_task_id": (follow_up or {}).get("id"),
             },
+            answered_at=answered_at,
         )
     return {
         "ok": True,

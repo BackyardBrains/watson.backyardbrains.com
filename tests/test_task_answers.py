@@ -193,6 +193,30 @@ def main() -> int:
         assert thurston["label"] not in actions, actions
         assert hidden[thurston["label"]].startswith("answered on "), hidden
 
+        again = mc.record_task_answer(
+            item_id="outreach:decide-on-thurston-elementary-science-fair-table", disposition="answered",
+            note="Answer: ask Jacob whether he wants to do it; he can be paid.", actor="Greg Gage", source="cortex-board",
+            todo={"title": thurston["label"], "project": "outreach"},
+        )
+        assert again["follow_up_task"]["id"] == result["follow_up_task"]["id"], "a retry must not open a second follow-up"
+
+        # --- An answer already on record is applied from its own capture and date.
+        captures_before = len(memory.captures)
+        late = mc.record_task_answer(
+            item_id="byb-api:exposed-internal-api-key", disposition="done", source="cortex-board",
+            todo={"title": "Exposed internal API key", "project": "byb-api"},
+            answer_capture_id=113827, answered_at="2026-11-20T20:10:00+00:00",
+        )
+        assert len(memory.captures) == captures_before, "no second capture for an answer already on record"
+        assert late["disposition"]["metadata"]["evidence_watermark"] == 113827, late
+        assert late["disposition"]["updated_at"] == "2026-11-20T20:10:00+00:00", late
+        key_item = {"label": "Exposed internal API key", "project": "byb-api", "evidence": "113757, 113763", "task_id": None}
+        memory.snapshot = red_packet([key_item])
+        assert shown()[1] == {"Exposed internal API key": "done on 2026-11-20"}
+        memory.snapshot = red_packet([{**key_item, "evidence": "113757, 113900"}])
+        assert shown()[0] == ["Exposed internal API key"], "evidence after the original answer reopens it"
+        memory.snapshot = red_packet([scanlon, thurston, book])
+
         # --- A comment leaves the item up and still gets an owner.
         result = mc.record_task_answer(
             item_id="mit-book:email-mit-press-for-editor-and-deadline", disposition="discuss",

@@ -136,6 +136,7 @@ class TaskDispositionStore:
         source_pointer: str | None = None,
         source_fingerprint_value: str | None = None,
         metadata: dict[str, Any] | None = None,
+        answered_at: str | None = None,
     ) -> dict[str, Any]:
         disposition_norm = str(disposition or "").strip().lower().replace("-", "_")
         if disposition_norm in {"wontdo", "won_t_do", "won't_do", "rejected"}:
@@ -148,7 +149,8 @@ class TaskDispositionStore:
             disposition_norm = "not_today"
         if disposition_norm not in TASK_DISPOSITIONS:
             raise ValueError(f"Invalid disposition {disposition!r}; expected one of {sorted(TASK_DISPOSITIONS)}")
-        now = utc_now()
+        # answered_at backdates an answer given earlier and only recorded now.
+        now = datetime.fromisoformat(answered_at).astimezone(timezone.utc).replace(microsecond=0).isoformat() if answered_at else utc_now()
         existing = self.get(task_key)
         created_at = str(existing.get("created_at")) if existing else now
         payload = {
