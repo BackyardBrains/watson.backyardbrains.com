@@ -1,0 +1,10 @@
+[Unit]
+Description=Watson right brain, 7:15am every day and 5:15pm on weekdays (Detroit time)
+
+[Timer]
+OnCalendar=*-*-* 07:15:00 America/Detroit
+OnCalendar=Mon..Fri *-*-* 17:15:00 America/Detroit
+Persistent=true
+
+[Install]
+WantedBy=timers.target

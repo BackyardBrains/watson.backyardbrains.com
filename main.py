@@ -359,6 +359,13 @@ def memory_context(q: str = Query('',max_length=2000),project_slug: str | None =
     return get_memory_context(q,project_slug,'watson-rest')
 
 
+def memory_brief(q: str = Query('',max_length=2000),project_slug: str | None = None):
+    """Standing rules, vocabulary and the records that match one request, in a few kilobytes."""
+    if not USE_MEMORY_API:raise HTTPException(422,'Memory API is disabled')
+    from memory_client import get_memory_brief
+    return get_memory_brief(q,project_slug,'watson-rest')
+
+
 class MemoryAuditPayload(BaseModel):
     limit: int = 200
     apply_quarantine: bool = False
@@ -527,7 +534,22 @@ def inbox(payload: InboxPayload):
 
 
 # --- MCP Server (auth via privateKey param, no Bearer) ---
-mcp = FastMCP("Watson",instructions='Before BYB work, call get_memory_context with the task question and project. Apply all active rules, cite source evidence, and state what is unknown. Retrieval alone does not prove compliance. Record feedback only after actual use or an observed miss.')
+MCP_INSTRUCTIONS = (
+    "Watson is Greg Gage's memory and task system for Backyard Brains and his family. "
+    "In any conversation with Greg, call get_memory_brief with his request BEFORE you answer or act, "
+    "even when the request looks simple. It returns his standing rules, his vocabulary and the records "
+    "that bear on the request, in a few kilobytes. Apply them, cite the capture IDs you used, and say "
+    "what is unknown. get_memory_context returns every active rule in full instead; use it for deep work "
+    "on one project or when your instructions require the complete rule packet. "
+    "Some of his words have one specific meaning: 'my share', 'the share' or 'share page' is "
+    "share.backyardbrains.com, so use publish_to_share and never hand him a Claude artifact, Google Doc "
+    "or other link unless he names it; 'Cortex' is his dashboard at cortex.backyardbrains.com; "
+    "'release' means merge, deploy and verify live. Email drafts go in his Gmail drafts. "
+    "When he says a Today item is done, snoozed or decided, record it with answer_today_item. "
+    "Save decisions, corrections and outcomes with post_inbox. "
+    "If a Watson call fails, tell him; do not answer as if Watson had been read."
+)
+mcp = FastMCP("Watson", instructions=MCP_INSTRUCTIONS)
 
 
 def _get_summary_data():
@@ -599,6 +621,29 @@ def get_memory_context(privateKey: str | None = None,q: str = '',project_slug: s
     if not USE_MEMORY_API:raise ValueError('Memory API is disabled')
     from memory_client import get_memory_context as get_context
     return get_context(q,project_slug,'watson-mcp')
+
+
+@mcp.tool(annotations=READ_ONLY, meta=META_SAFE)
+def get_memory_brief(privateKey: str | None = None,q: str = '',project_slug: str | None = None) -> dict:
+    """Call this first in a chat, with Greg's request as q. Returns his standing rules and vocabulary
+    whole, plus excerpts of the rules and records that match the request, in a few kilobytes. It is not
+    the complete rule list; get_memory_context is. Fetching does not prove compliance."""
+    _verify_private_key(privateKey)
+    if not USE_MEMORY_API:raise ValueError('Memory API is disabled')
+    from memory_client import get_memory_brief as get_brief
+    return get_brief(q,project_slug,'watson-mcp')
+
+
+@mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)
+def publish_to_share(title: str, markdown: str, page_id: str = "", privateKey: str | None = None) -> dict:
+    """Put a document on Greg's share site and return its link. "My share", "the share" and "share page"
+    all mean share.backyardbrains.com. Use this whenever Greg asks to add, put or publish a doc there;
+    do not give him a Claude artifact, Google Doc or other link instead. Write the document as Markdown
+    (headings, lists, tables, links); raw HTML is shown as text. Anyone with the link can read the page;
+    it is not listed or indexed. Pass page_id from an earlier result to replace that page's content."""
+    _verify_private_key(privateKey)
+    from share_publish import publish_page
+    return publish_page(title, markdown, page_id=page_id or None, actor="watson-mcp")
 
 
 @mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)
@@ -1098,6 +1143,7 @@ app.get("/links", dependencies=[Depends(verify_secret)])(links)
 app.post("/inbox", dependencies=[Depends(verify_secret)])(inbox)
 app.get("/memory/search", dependencies=[Depends(verify_secret)])(memory_search)
 app.get("/memory/context", dependencies=[Depends(verify_secret)])(memory_context)
+app.get("/memory/brief", dependencies=[Depends(verify_secret)])(memory_brief)
 app.post("/memory/audit", dependencies=[Depends(verify_secret)])(memory_audit)
 app.get("/memory/quality", dependencies=[Depends(verify_secret)])(memory_quality)
 app.get("/files/{name}")(get_file)

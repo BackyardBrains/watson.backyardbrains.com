@@ -1,0 +1,10 @@
+[Unit]
+Description=Watson right brain: keep Today, tasks and the next 14 days true (headless Claude, rb tool only)
+After=network-online.target docker.service
+Wants=network-online.target
+OnFailure=byb-routine-failed@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/var/www/watson.backyardbrains.com/right_brain/run.sh
+TimeoutStartSec=2700
