@@ -30,7 +30,8 @@ OWNER_FOLDER = "greg"
 MARKER_FILE = ".published-by-watson.json"
 PAGE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-[A-Za-z0-9]{12}")
 MAX_TITLE_CHARS = 140
-MAX_DOCUMENT_CHARS = 400_000
+MAX_DOCUMENT_CHARS = 200_000
+MAX_PAGE_BYTES = 3_000_000
 TOKEN_ALPHABET = string.ascii_letters + string.digits
 RENDER_SECONDS = 15
 RENDER_MEMORY_BYTES = 768 * 1024 * 1024
@@ -45,7 +46,10 @@ resource.setrlimit(resource.RLIMIT_AS, (int(sys.argv[1]), int(sys.argv[1])))
 resource.setrlimit(resource.RLIMIT_CPU, (int(sys.argv[2]), int(sys.argv[2])))
 from markdown_it import MarkdownIt
 text = sys.stdin.buffer.read().decode("utf-8")
-sys.stdout.buffer.write(MarkdownIt("commonmark", {"html": False}).enable("table").render(text).encode("utf-8"))
+page = MarkdownIt("commonmark", {"html": False}).enable("table").render(text).encode("utf-8")
+if len(page) > int(sys.argv[3]):
+    sys.exit(3)  # a small document can expand into a huge page (one link definition used 15,000 times)
+sys.stdout.buffer.write(page)
 """
 
 PAGE_TEMPLATE = """<!doctype html>
@@ -98,13 +102,13 @@ def _render_markdown(text: str) -> str:
         return "\n".join("<p>" + html.escape(block).replace("\n", "<br>\n") + "</p>" for block in blocks)
     try:
         child = subprocess.run(
-            [sys.executable, "-c", RENDER_CHILD, str(RENDER_MEMORY_BYTES), str(RENDER_SECONDS)],
+            [sys.executable, "-c", RENDER_CHILD, str(RENDER_MEMORY_BYTES), str(RENDER_SECONDS), str(MAX_PAGE_BYTES)],
             input=text.encode("utf-8"), capture_output=True, timeout=RENDER_SECONDS + 5, cwd="/",
         )
     except subprocess.TimeoutExpired:
         child = None
     if child is None or child.returncode != 0:
-        raise ValueError("the document could not be rendered within the time and memory allowed; simplify its formatting")
+        raise ValueError("the document could not be rendered within the time, memory and page size allowed; simplify its formatting")
     return child.stdout.decode("utf-8")
 
 

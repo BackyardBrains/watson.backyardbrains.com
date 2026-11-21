@@ -174,7 +174,7 @@ def stdin_text() -> str:
         info = os.fstat(sys.stdin.fileno())
     except (OSError, ValueError):
         info = None
-    if info and stat.S_ISREG(info.st_mode) and info.st_nlink > 0:
+    if info and not stat.S_ISFIFO(info.st_mode) and not (stat.S_ISREG(info.st_mode) and info.st_nlink == 0):
         # `rb note < /some/file` would copy a file from this server into a note
         # or a draft. Text comes from a heredoc or a pipe, never from a file.
         raise RbError("text must come from a heredoc, not from a file")
@@ -470,8 +470,15 @@ def cmd_share(args: argparse.Namespace) -> None:
     folder = Path(SHARE_ROOT) / share_publish.OWNER_FOLDER / result["page_id"]
     owner = folder.parent.stat()
     for path in [folder, *folder.iterdir()]:  # keep the page editable by the Watson service account
-        os.chown(path, owner.st_uid, owner.st_gid)
+        if not path.is_symlink():
+            os.chown(path, owner.st_uid, owner.st_gid, follow_symlinks=False)
     emit(result)
+
+
+def _https_link(url: str) -> str:
+    if not re.fullmatch(r"https://[^\s<>\"']+", url):
+        raise RbError(f"a link must be an https:// address: {url[:80]!r}")
+    return url
 
 
 def _action_items(rows: list[dict[str, Any]], priority: str) -> list[dict[str, Any]]:
@@ -482,10 +489,15 @@ def _action_items(rows: list[dict[str, Any]], priority: str) -> list[dict[str, A
             raise RbError("every item needs a label")
         item: dict[str, Any] = {"label": label, "detail": str(row.get("detail") or ""), "priority": priority, "kind": "act",
                                 "project": str(row.get("project") or "general"), "evidence": str(row.get("evidence") or "")}
+        if item["evidence"] and not re.fullmatch(r"\d{1,9}(\s*,\s*\d{1,9})*", item["evidence"]):
+            raise RbError(f"evidence for {label!r} must be capture ids separated by commas")
         if row.get("task_id"):
-            item["task_id"] = int(str(row["task_id"]).lstrip("#Tt "))
+            task_id = str(row["task_id"]).lstrip("#Tt ")
+            if not task_id.isdigit() or int(task_id) < 1:
+                raise RbError(f"task for {label!r} must be a task id")
+            item["task_id"] = int(task_id)
         if row.get("action_url"):
-            item["action_url"] = str(row["action_url"])
+            item["action_url"] = _https_link(str(row["action_url"]))
         items.append(item)
     return items
 
@@ -533,6 +545,8 @@ def parse_dashboard(text: str) -> dict[str, Any]:
             raise RbError(f"dashboard line not understood: {line[:80]!r}")
     for item in plan["prepared"]:
         item["title"], item["url"], item["description"] = item.pop("label"), item.pop("action_url", ""), item.pop("detail", "")
+        if item["url"]:
+            _https_link(item["url"])
     return plan
 
 

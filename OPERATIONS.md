@@ -30,8 +30,8 @@ preparation true, and `rb`, the one command it may run. See
 
 ## What chat assistants get
 
-`get_memory_context` (MCP) returns the brief from Memory `/v1/brief`: Greg's
+`get_memory_brief` (MCP) returns the brief from Memory `/v1/brief`: Greg's
 standing rules and vocabulary in full, plus the rules and records that match
-the request. The complete rule packet is `full=true`. `publish_to_share` writes
+the request. The complete rule packet is still `get_memory_context`. `publish_to_share` writes
 a page under `share.backyardbrains.com/greg/` through the share mount at
 `/data/workspaces/main/share`.

@@ -536,10 +536,11 @@ def inbox(payload: InboxPayload):
 # --- MCP Server (auth via privateKey param, no Bearer) ---
 MCP_INSTRUCTIONS = (
     "Watson is Greg Gage's memory and task system for Backyard Brains and his family. "
-    "In any conversation with Greg, call get_memory_context with his request BEFORE you answer or act, "
+    "In any conversation with Greg, call get_memory_brief with his request BEFORE you answer or act, "
     "even when the request looks simple. It returns his standing rules, his vocabulary and the records "
     "that bear on the request, in a few kilobytes. Apply them, cite the capture IDs you used, and say "
-    "what is unknown. "
+    "what is unknown. get_memory_context returns every active rule in full instead; use it for deep work "
+    "on one project or when your instructions require the complete rule packet. "
     "Some of his words have one specific meaning: 'my share', 'the share' or 'share page' is "
     "share.backyardbrains.com, so use publish_to_share and never hand him a Claude artifact, Google Doc "
     "or other link unless he names it; 'Cortex' is his dashboard at cortex.backyardbrains.com; "
@@ -614,14 +615,23 @@ def search_memory(
 
 
 @mcp.tool(annotations=READ_ONLY, meta=META_SAFE)
-def get_memory_context(privateKey: str | None = None,q: str = '',project_slug: str | None = None,full: bool = False) -> dict:
-    """Call this first, with Greg's request as q. Returns his standing rules, his vocabulary, and the
-    rules and records that match the request, in a few kilobytes. Fetching does not prove compliance.
-    full=true returns every active rule in full instead (hundreds of kilobytes without a project_slug)."""
+def get_memory_context(privateKey: str | None = None,q: str = '',project_slug: str | None = None) -> dict:
+    """Start a task with current rules and relevant source excerpts; fetching does not prove compliance."""
     _verify_private_key(privateKey)
     if not USE_MEMORY_API:raise ValueError('Memory API is disabled')
-    from memory_client import get_memory_brief, get_memory_context as get_context
-    return get_context(q,project_slug,'watson-mcp') if full else get_memory_brief(q,project_slug,'watson-mcp')
+    from memory_client import get_memory_context as get_context
+    return get_context(q,project_slug,'watson-mcp')
+
+
+@mcp.tool(annotations=READ_ONLY, meta=META_SAFE)
+def get_memory_brief(privateKey: str | None = None,q: str = '',project_slug: str | None = None) -> dict:
+    """Call this first in a chat, with Greg's request as q. Returns his standing rules and vocabulary
+    whole, plus excerpts of the rules and records that match the request, in a few kilobytes. It is not
+    the complete rule list; get_memory_context is. Fetching does not prove compliance."""
+    _verify_private_key(privateKey)
+    if not USE_MEMORY_API:raise ValueError('Memory API is disabled')
+    from memory_client import get_memory_brief as get_brief
+    return get_brief(q,project_slug,'watson-mcp')
 
 
 @mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)

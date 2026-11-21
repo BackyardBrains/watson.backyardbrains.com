@@ -77,6 +77,10 @@ print(json.dumps({
 }))
 PY
 
+# A run stopped by the spending cap or an API error can still exit 0.
+if [ "$RC" -eq 0 ] && ! python3 -c 'import json,sys; sys.exit(1 if json.load(open(sys.argv[1])).get("is_error") else 0)' "$STATE/logs/$RUN_ID.json"; then
+  RC=3
+fi
 if [ "$RC" -ne 0 ]; then
   echo "right brain run $RUN_ID failed with exit $RC; see $STATE/logs/$RUN_ID.err" >&2
 fi
