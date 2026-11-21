@@ -71,6 +71,22 @@ def main() -> int:
         sp.RENDER_CHILD = real_child
         assert sorted(path.name for path in (Path(tmp) / "greg").iterdir()) == before
 
+        # The REST route publishes with the Watson secret and refuses without it.
+        os.environ.update(DATA_PATH=tmp, API_SECRET="test-secret", MEMORY_API_KEY="x")
+        try:
+            from fastapi.testclient import TestClient
+            import main  # type: ignore
+        except ImportError:
+            print("SKIP: REST route check needs the service's packages (runs in the container image).")
+        else:
+            client = TestClient(main.app)
+            body = {"title": "From REST", "markdown": "Hello **there**.", "actor": "grokbot"}
+            assert client.post("/share/publish", json=body).status_code == 401
+            made = client.post("/share/publish?secret=test-secret", json=body)
+            assert made.status_code == 200 and made.json()["url"].startswith(sp.SHARE_BASE_URL + "/greg/from-rest-"), made.text
+            assert "<strong>there</strong>" in (Path(tmp) / "greg" / made.json()["page_id"] / "index.html").read_text()
+            assert client.post("/share/publish?secret=test-secret", json={"title": "x", "markdown": "y", "page_id": "byb-rules-90Oyk26USxkj"}).status_code == 422
+
     print("OK: share pages are published safely and only this tool's pages can be replaced.")
     return 0
 
