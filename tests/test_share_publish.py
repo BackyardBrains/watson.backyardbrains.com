@@ -55,6 +55,22 @@ def main() -> int:
             except ValueError:
                 pass
 
+        # A document that makes the renderer exceed its memory or time is refused
+        # and leaves no folder behind. (With markdown-it-py 3, 100,000 characters
+        # of "*a " is such a document; here the renderer is made greedy directly.)
+        before = sorted(path.name for path in (Path(tmp) / "greg").iterdir())
+        real_child = sp.RENDER_CHILD
+        for greedy in ("hog = bytearray(2 * int(sys.argv[1]))", "while True: pass"):
+            sp.RENDER_CHILD = real_child.replace("from markdown_it import MarkdownIt", greedy + "\nfrom markdown_it import MarkdownIt")
+            sp.RENDER_SECONDS = 1
+            try:
+                sp.publish_page("Heavy", "text")
+                raise AssertionError("a document that exhausts the renderer must be refused")
+            except ValueError as exc:
+                assert "could not be rendered" in str(exc), exc
+        sp.RENDER_CHILD = real_child
+        assert sorted(path.name for path in (Path(tmp) / "greg").iterdir()) == before
+
     print("OK: share pages are published safely and only this tool's pages can be replaced.")
     return 0
 

@@ -17,6 +17,8 @@ import os
 import re
 import secrets
 import string
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,21 @@ PAGE_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-[A-Za-z0-9]{12}")
 MAX_TITLE_CHARS = 140
 MAX_DOCUMENT_CHARS = 400_000
 TOKEN_ALPHABET = string.ascii_letters + string.digits
+RENDER_SECONDS = 15
+RENDER_MEMORY_BYTES = 768 * 1024 * 1024
+
+# Some Markdown makes the renderer use memory or time out of all proportion to
+# its size (100,000 characters of "*a " needs gigabytes). The renderer therefore
+# runs in a child process that limits itself first, so a bad document fails on
+# its own instead of taking the service down with it.
+RENDER_CHILD = """
+import resource, sys
+resource.setrlimit(resource.RLIMIT_AS, (int(sys.argv[1]), int(sys.argv[1])))
+resource.setrlimit(resource.RLIMIT_CPU, (int(sys.argv[2]), int(sys.argv[2])))
+from markdown_it import MarkdownIt
+text = sys.stdin.buffer.read().decode("utf-8")
+sys.stdout.buffer.write(MarkdownIt("commonmark", {"html": False}).enable("table").render(text).encode("utf-8"))
+"""
 
 PAGE_TEMPLATE = """<!doctype html>
 <html lang="en">
@@ -73,13 +90,22 @@ def _slug(title: str) -> str:
 
 def _render_markdown(text: str) -> str:
     try:
-        from markdown_it import MarkdownIt
+        import markdown_it  # noqa: F401
     except ImportError:
         # The image ships markdown-it-py. Without it, publish readable plain
         # text rather than fail; everything is escaped either way.
         blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
         return "\n".join("<p>" + html.escape(block).replace("\n", "<br>\n") + "</p>" for block in blocks)
-    return MarkdownIt("commonmark", {"html": False}).enable("table").render(text)
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", RENDER_CHILD, str(RENDER_MEMORY_BYTES), str(RENDER_SECONDS)],
+            input=text.encode("utf-8"), capture_output=True, timeout=RENDER_SECONDS + 5, cwd="/",
+        )
+    except subprocess.TimeoutExpired:
+        child = None
+    if child is None or child.returncode != 0:
+        raise ValueError("the document could not be rendered within the time and memory allowed; simplify its formatting")
+    return child.stdout.decode("utf-8")
 
 
 def _write(path: Path, content: str) -> None:
@@ -103,6 +129,7 @@ def publish_page(title: str, markdown_text: str, page_id: str | None = None, act
     if not owner.is_dir():
         raise RuntimeError("the share folder is not available on this server")
 
+    body = _render_markdown(text)
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     record: dict[str, Any] = {"title": clean_title, "published_at": now, "updated_at": now, "actor": actor}
     if page_id:
@@ -124,7 +151,6 @@ def publish_page(title: str, markdown_text: str, page_id: str | None = None, act
         folder.mkdir(mode=0o755)
         os.chmod(folder, 0o755)
 
-    body = _render_markdown(text)
     _write(folder / "index.html", PAGE_TEMPLATE.format(title=html.escape(clean_title), body=body))
     _write(folder / "source.md", text + "\n")
     _write(folder / MARKER_FILE, json.dumps(record, indent=1) + "\n")

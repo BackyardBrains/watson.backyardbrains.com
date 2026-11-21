@@ -379,14 +379,20 @@ def cmd_note(args: argparse.Namespace) -> None:
     text = stdin_text()
     if not text:
         raise RbError("put the note on stdin")
-    if "coach:watson" in text[:300].lower():
-        # Notes tagged coach:watson become standing rules for every assistant.
-        # Only Greg's own corrections belong there; a routine never writes one.
-        raise RbError("a routine note must not carry the coach:watson tag")
-    body = {"raw_content": (f"[project: {args.project}] " if args.project else "") + text, "source": SOURCE}
+    if re.search(r"coach:watson|\[(standing-rules|memory-protocol|greg-vocabulary)\]", text, re.I):
+        # These tags mark Greg's standing rules for every assistant. Only his
+        # own corrections belong there; a routine never writes one.
+        raise RbError("a routine note must not carry a standing-rule tag")
+    if args.project and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", args.project):
+        raise RbError("--project takes a project slug")
+    # Saved as plain knowledge whatever the text says: Memory would otherwise
+    # read tags in the text and could file the note as a rule.
+    body = {"raw_content": text, "source": SOURCE, "memory_visibility": "knowledge"}
+    if args.project:
+        body["project_slug"] = args.project
     log("note", {"project": args.project, "note": first_line(text)})
     if DRY_RUN:
-        return emit({"dry_run": True, "would_capture": body["raw_content"][:400]})
+        return emit({"dry_run": True, "would_capture": {**body, "raw_content": body["raw_content"][:400]}})
     saved = memory("/v1/captures", method="POST", body=body)
     capture_id = saved.get("capture_id") or saved.get("id")
     check = memory(f"/v1/captures/{capture_id}")
