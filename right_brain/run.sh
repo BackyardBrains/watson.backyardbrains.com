@@ -20,7 +20,7 @@ MAX_USD=${RIGHT_BRAIN_MAX_USD:-8}
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 
 export HOME=/root
-export PATH=/usr/local/bin:/root/.local/bin:/usr/bin:/bin
+export PATH="$HERE/bin:/usr/local/bin:/root/.local/bin:/usr/bin:/bin"
 export RB_RUN_LOG="$STATE/runs/$RUN_ID.jsonl"
 export RB_DRY_RUN=${RIGHT_BRAIN_DRY_RUN:-}
 

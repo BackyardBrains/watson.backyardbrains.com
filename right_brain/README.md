@@ -15,13 +15,13 @@ OpenClaw-era routines that last ran on Sep 9, 2026.
 ## Install on app
 
 ```sh
-ln -sf /var/www/watson.backyardbrains.com/right_brain/rb.py /usr/local/bin/rb
 install -m 600 right_brain/right-brain.env.example /etc/byb/right-brain.env
 cp right_brain/systemd/byb-right-brain.{service,timer} /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now byb-right-brain.timer
 ```
 
+`run.sh` puts `right_brain/bin` on the session's PATH, so `rb` needs no install.
 Run once by hand with `right_brain/run.sh`. Rehearse without writing anything
 with `RIGHT_BRAIN_DRY_RUN=1 right_brain/run.sh`.
 
