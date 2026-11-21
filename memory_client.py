@@ -727,6 +727,13 @@ def get_memory_context(q: str = '', project_slug: str | None = None, client: str
     return _get('/v1/context',params)
 
 
+def get_memory_brief(q: str = '', project_slug: str | None = None, client: str = 'watson') -> dict:
+    """The context a chat assistant can read: standing rules, vocabulary, and what matches the request."""
+    params={'q':q,'client':client}
+    if project_slug:params['project_slug']=project_slug
+    return _get('/v1/brief',params)
+
+
 def record_memory_feedback(context_id: str,outcome: str,capture_ids: list[int]) -> dict:
     return _post('/v1/feedback',dict(context_id=context_id,outcome=outcome,capture_ids=capture_ids))
 

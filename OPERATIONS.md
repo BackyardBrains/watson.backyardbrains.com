@@ -21,3 +21,17 @@ Local isolated checks: `python3 tests/test_watson_ideas.py` and
 `python3 tests/test_watson_queue_steward.py` and
 `python3 tests/test_project_status_overrides.py` and
 `python3 tests/test_task_answers.py`. These use temporary SQLite databases.
+
+## Right brain
+
+`right_brain/` holds the scheduled Claude routine that keeps Today, tasks and
+preparation true, and `rb`, the one command it may run. See
+`right_brain/README.md` for install, the model switch file and logs.
+
+## What chat assistants get
+
+`get_memory_context` (MCP) returns the brief from Memory `/v1/brief`: Greg's
+standing rules and vocabulary in full, plus the rules and records that match
+the request. The complete rule packet is `full=true`. `publish_to_share` writes
+a page under `share.backyardbrains.com/greg/` through the share mount at
+`/data/workspaces/main/share`.

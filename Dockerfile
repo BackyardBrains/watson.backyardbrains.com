@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py memory_client.py background_queue.py capture_quality.py task_state.py watson_ideas.py ./
+COPY main.py memory_client.py background_queue.py capture_quality.py task_state.py watson_ideas.py share_publish.py ./
 RUN chmod 0644 /app/*.py
 
 ENV DATA_PATH=/data
