@@ -366,6 +366,25 @@ def memory_brief(q: str = Query('',max_length=2000),project_slug: str | None = N
     return get_memory_brief(q,project_slug,'watson-rest')
 
 
+class SharePublishPayload(BaseModel):
+    title: str
+    markdown: str
+    page_id: str | None = None
+    actor: str | None = None
+
+
+def share_publish_post(payload: SharePublishPayload):
+    """Put a Markdown document on Greg's share site; the same publisher as the MCP tool publish_to_share."""
+    from share_publish import publish_page
+    try:
+        return publish_page(payload.title, payload.markdown, page_id=payload.page_id or None,
+                            actor=(payload.actor or "watson-rest")[:60])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 class MemoryAuditPayload(BaseModel):
     limit: int = 200
     apply_quarantine: bool = False
@@ -1144,6 +1163,7 @@ app.post("/inbox", dependencies=[Depends(verify_secret)])(inbox)
 app.get("/memory/search", dependencies=[Depends(verify_secret)])(memory_search)
 app.get("/memory/context", dependencies=[Depends(verify_secret)])(memory_context)
 app.get("/memory/brief", dependencies=[Depends(verify_secret)])(memory_brief)
+app.post("/share/publish", dependencies=[Depends(verify_secret)])(share_publish_post)
 app.post("/memory/audit", dependencies=[Depends(verify_secret)])(memory_audit)
 app.get("/memory/quality", dependencies=[Depends(verify_secret)])(memory_quality)
 app.get("/files/{name}")(get_file)
