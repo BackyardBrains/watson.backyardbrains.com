@@ -22,6 +22,11 @@ Pass long text on stdin with a heredoc:
     text
     EOF
 
+The sandbox refuses a command whose arguments contain a dollar sign, a
+backtick or braces, and refuses braces anywhere, heredoc included. Keep
+arguments to plain words in single quotes and put everything else in the
+heredoc. If a command is refused, reword it that way and try once more.
+
 Run `rb --help` and `rb <verb> --help` when unsure. Reads: `today`, `tasks`,
 `task`, `projects`, `project`, `brief`, `search`, `capture`, `mail-search`,
 `mail-thread`, `mail-drafts`, `calendar`. Writes: `task-new`, `task-update`,
@@ -48,7 +53,7 @@ file on style and content.
 
 - `rb today` shows what is Red now and, under `hidden_now`, what Greg already
   answered and when.
-- `rb tasks` lists every open task. `rb tasks --owner watson` lists the ones
+- `rb tasks` lists the open tasks (`--all` adds the deferred and snoozed ones). `rb tasks --owner watson` lists the ones
   that are yours to carry out.
 - `rb projects`
 - `rb calendar --days 14`
@@ -118,17 +123,23 @@ nothing, like a drive or a game.
 ## Step 7. Publish Today
 
     rb dashboard <<'EOF'
-    {
-      "what_changed": "Two or three sentences. Dates written out, like Sat Nov 21.",
-      "red": [
-        {"label": "Imperative action for Greg", "detail": "why today, in one line",
-         "project": "slug", "task_id": 638, "evidence": "113664, 113518",
-         "action_url": "link to the draft or thread, if any"}
-      ],
-      "waiting": [{"label": "Who owes what", "detail": "since when", "project": "slug", "evidence": "113700"}],
-      "prepared": [{"title": "What it is", "url": "https://share.backyardbrains.com/greg/...", "description": "for which event"}]
-    }
+    CHANGED: Two or three sentences. Dates written out, like Sat Nov 21.
+    RED: Imperative action for Greg
+      task: 638
+      project: mit-book
+      why: why today, in one line
+      evidence: 113664, 113518
+      link: link to the draft or thread, if any
+    WAITING: Who owes what
+      project: outreach
+      why: since when
+      evidence: 113700
+    PREPARED: What it is
+      link: https://share.backyardbrains.com/greg/...
+      why: for which event
     EOF
+
+Repeat a RED, WAITING or PREPARED block for each item. No braces, no JSON.
 
 `evidence` holds memory capture ids only. `rb dashboard` prints what Today shows
 after publishing. If it differs from what you sent, read `hidden_now`, fix the

@@ -76,21 +76,27 @@ def main() -> int:
     assert calls[0][3] == {"raw_content": "[project: mit-book] [briefing][right-brain] Sat Nov 21, 2026", "source": "server-claude"}
     calls.clear()
 
-    # Today takes at most three Red items, each with proof.
-    red = {"label": "Email MIT Press for the editor", "detail": "due Tue Nov 24", "project": "mit-book", "task_id": 638, "evidence": "113518"}
-    code, _, err = run(rb, ["dashboard"], json.dumps({"red": [red] * 4}))
+    # Today takes at most three Red items, each with proof. Input is plain lines, never JSON.
+    red_lines = "RED: Email MIT Press for the editor\n  task: 638\n  project: mit-book\n  why: due Tue Nov 24\n  evidence: 113518\n"
+    code, _, err = run(rb, ["dashboard"], red_lines * 4)
     assert code == 1 and "at most 3" in err and not calls
-    code, _, err = run(rb, ["dashboard"], json.dumps({"red": [{"label": "Do a thing", "project": "x"}]}))
+    code, _, err = run(rb, ["dashboard"], "RED: Do a thing\n  project: x\n")
     assert code == 1 and "needs evidence" in err and not calls
-    code, out, _ = run(rb, ["dashboard"], json.dumps({"what_changed": "One change.", "red": [red], "waiting": [{"label": "Jacob owes a reply", "project": "outreach"}],
-                                                       "prepared": [{"title": "Agenda", "url": "https://share.backyardbrains.com/greg/a-AAAAAAAAAAAA/", "description": "Dec 3"}]}))
+    code, _, err = run(rb, ["dashboard"], "RED: Do a thing\n  bogus: x\n")
+    assert code == 1 and "not understood" in err and not calls
+    code, out, _ = run(rb, ["dashboard"], "CHANGED: One change.\n" + red_lines
+                       + "WAITING: Jacob owes a reply\n  project: outreach\n  why: draft saved Fri Nov 20\n"
+                       + "PREPARED: Agenda\n  link: https://share.backyardbrains.com/greg/a-AAAAAAAAAAAA/\n  why: Dec 3\n")
     assert code == 0, out
     snapshot = calls[0][3]
     assert calls[0][:3] == ("memory", "POST", "/v1/agents/status")
     assert snapshot["agent_id"] == "watson" and snapshot["source_ref"] == "server-claude:right-brain" and snapshot["needs_you_count"] == 1
     assert [block["title"] for block in snapshot["blocks"]] == ["Today", "Red", "Waiting and backlog", "Prepared work"]
-    assert snapshot["blocks"][1]["items"][0] == {"label": red["label"], "detail": red["detail"], "priority": "red", "kind": "act", "project": "mit-book", "evidence": "113518", "task_id": 638}
-    assert snapshot["blocks"][2]["items"][0]["priority"] == "orange"
+    assert snapshot["blocks"][0]["body"] == "One change."
+    assert snapshot["blocks"][1]["items"][0] == {"label": "Email MIT Press for the editor", "detail": "due Tue Nov 24", "priority": "red", "kind": "act", "project": "mit-book", "evidence": "113518", "task_id": 638}
+    assert snapshot["blocks"][2]["items"][0]["priority"] == "orange" and snapshot["blocks"][2]["items"][0]["detail"] == "draft saved Fri Nov 20"
+    assert snapshot["blocks"][3]["items"] == [{"title": "Agenda", "url": "https://share.backyardbrains.com/greg/a-AAAAAAAAAAAA/", "description": "Dec 3"}]
+    assert "{" not in red_lines, "the sandbox refuses braces in a heredoc"
     assert json.loads(out)["red_now"] == ["Email MIT Press"], "the readback shows what Today displays, not what was sent"
     calls.clear()
 
@@ -103,7 +109,7 @@ def main() -> int:
                         (["task-new", "--project", "none", "--owner", "watson", "--why", "decision 113611"], "Ask Jacob"),
                         (["answer", "638", "--disposition", "done", "--title", "Email MIT Press", "--project", "mit-book", "--why", "sent"], ""),
                         (["mail-draft", "--to", "a@b.org", "--subject", "Hi", "--why", "task 652"], "Body"),
-                        (["note"], "A note"), (["dashboard"], json.dumps({"red": [red]}))):
+                        (["note"], "A note"), (["dashboard"], red_lines)):
         code, out, _ = run(rb, argv, stdin)
         assert code == 0 and json.loads(out)["dry_run"] is True, (argv, out)
     assert not [c for c in calls if c[0] != "gws" and c[1] != "GET"], calls

@@ -215,12 +215,19 @@ def _task_line(task: dict[str, Any]) -> dict[str, Any]:
 
 def cmd_tasks(args: argparse.Namespace) -> None:
     tasks = watson("/tasks", include_complete="false", limit=200, project=args.project)["tasks"]
+    parked = [task for task in tasks if str(task.get("status")) in {"deferred", "snoozed"}]
+    if not args.all:
+        tasks = [task for task in tasks if task not in parked]
     if args.owner:
         tasks = [task for task in tasks if (task.get("owner") or "greg").lower() == args.owner]
     if args.due_within is not None:
         horizon = (date.today() + timedelta(days=args.due_within)).isoformat()
         tasks = [task for task in tasks if str(task.get("dueDate") or "")[:10] and str(task.get("dueDate"))[:10] <= horizon]
-    emit({"open_tasks": len(tasks), "tasks": [_task_line(task) for task in tasks]})
+    lines = [f"{len(tasks)} open tasks" + ("" if args.all else f" ({len(parked)} deferred or snoozed ones hidden; --all shows them)"),
+             "id | status | due | owner | project | task"]
+    for row in (_task_line(task) for task in tasks):
+        lines.append(f"{row['id']} | {row['status']} | {row['due'] or '-'} | {row['owner']} | {row['project'] or '-'} | {row['task'][:110]}")
+    emit("\n".join(lines))
 
 
 def cmd_task(args: argparse.Namespace) -> None:
@@ -470,18 +477,61 @@ def _action_items(rows: list[dict[str, Any]], priority: str) -> list[dict[str, A
         item: dict[str, Any] = {"label": label, "detail": str(row.get("detail") or ""), "priority": priority, "kind": "act",
                                 "project": str(row.get("project") or "general"), "evidence": str(row.get("evidence") or "")}
         if row.get("task_id"):
-            item["task_id"] = int(row["task_id"])
+            item["task_id"] = int(str(row["task_id"]).lstrip("#Tt "))
         if row.get("action_url"):
             item["action_url"] = str(row["action_url"])
         items.append(item)
     return items
 
 
+DASHBOARD_SECTIONS = {"RED": "red", "WAITING": "waiting", "PREPARED": "prepared"}
+DASHBOARD_FIELDS = {"task": "task_id", "project": "project", "why": "detail", "evidence": "evidence", "link": "action_url"}
+
+
+def parse_dashboard(text: str) -> dict[str, Any]:
+    """Read the plain-line dashboard format.
+
+        CHANGED: what changed, two or three sentences
+        RED: Imperative action for Greg
+          task: 638
+          project: mit-book
+          why: one line on why today
+          evidence: 113664, 113518
+          link: https://...
+        WAITING: Who owes what          (same fields)
+        PREPARED: What it is            (link and why)
+
+    Plain lines rather than JSON: the session's sandbox refuses a heredoc that
+    contains braces.
+    """
+    plan: dict[str, Any] = {"what_changed": "", "red": [], "waiting": [], "prepared": []}
+    current: dict[str, Any] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        head, _, rest = line.partition(":")
+        key = head.strip()
+        value = rest.strip()
+        if key.upper() == "CHANGED":
+            plan["what_changed"] = value
+            current = None
+        elif key.upper() in DASHBOARD_SECTIONS:
+            current = {"label": value}
+            plan[DASHBOARD_SECTIONS[key.upper()]].append(current)
+        elif current is not None and key.lower() in DASHBOARD_FIELDS:
+            current[DASHBOARD_FIELDS[key.lower()]] = value
+        elif current is None and plan["what_changed"] and not plan["red"]:
+            plan["what_changed"] += " " + line  # a CHANGED sentence that wrapped
+        else:
+            raise RbError(f"dashboard line not understood: {line[:80]!r}")
+    for item in plan["prepared"]:
+        item["title"], item["url"], item["description"] = item.pop("label"), item.pop("action_url", ""), item.pop("detail", "")
+    return plan
+
+
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    try:
-        plan = json.loads(stdin_text() or "{}")
-    except ValueError as exc:
-        raise RbError(f"dashboard JSON did not parse: {exc}") from exc
+    plan = parse_dashboard(stdin_text())
     red = plan.get("red") or []
     if len(red) > MAX_RED_ITEMS:
         raise RbError(f"at most {MAX_RED_ITEMS} Red items; put the rest under waiting")
@@ -515,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="verb", required=True)
 
     sub.add_parser("today", help="Red items on Today now, and what is hidden and why").set_defaults(run=cmd_today)
-    p = sub.add_parser("tasks", help="open tasks"); p.add_argument("--project"); p.add_argument("--owner", choices=["greg", "watson"]); p.add_argument("--due-within", type=int); p.set_defaults(run=cmd_tasks)
+    p = sub.add_parser("tasks", help="open tasks"); p.add_argument("--project"); p.add_argument("--owner", choices=["greg", "watson"]); p.add_argument("--due-within", type=int); p.add_argument("--all", action="store_true"); p.set_defaults(run=cmd_tasks)
     p = sub.add_parser("task", help="one task in full"); p.add_argument("id"); p.set_defaults(run=cmd_task)
     sub.add_parser("projects", help="active projects").set_defaults(run=cmd_projects)
     p = sub.add_parser("project", help="one project row"); p.add_argument("slug"); p.set_defaults(run=cmd_project)
@@ -534,7 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("project-status", help="replace a project's status text (text on stdin)"); p.add_argument("slug"); p.add_argument("--waiting-on"); p.add_argument("--why", required=True); p.set_defaults(run=cmd_project_status)
     p = sub.add_parser("mail-draft", help="save a draft in Greg's Gmail (body on stdin); never sends"); p.add_argument("--to", nargs="+", required=True); p.add_argument("--cc", nargs="*"); p.add_argument("--subject"); p.add_argument("--reply-to"); p.add_argument("--why", required=True); p.set_defaults(run=cmd_mail_draft)
     p = sub.add_parser("share", help="publish a document to Greg's share site (Markdown on stdin)"); p.add_argument("--title", required=True); p.add_argument("--page-id"); p.set_defaults(run=cmd_share)
-    sub.add_parser("dashboard", help="publish Today (JSON on stdin) and read it back").set_defaults(run=cmd_dashboard)
+    sub.add_parser("dashboard", help="publish Today (plain lines on stdin: CHANGED / RED / WAITING / PREPARED) and read it back").set_defaults(run=cmd_dashboard)
     return parser
 
 
