@@ -19,4 +19,5 @@ including queue, capture-quality, task-state and ideas modules missing upstream.
 
 Local isolated checks: `python3 tests/test_watson_ideas.py` and
 `python3 tests/test_watson_queue_steward.py` and
-`python3 tests/test_project_status_overrides.py`. These use temporary SQLite databases.
+`python3 tests/test_project_status_overrides.py` and
+`python3 tests/test_task_answers.py`. These use temporary SQLite databases.

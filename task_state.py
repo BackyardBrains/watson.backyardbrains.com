@@ -36,7 +36,9 @@ def today_local_date() -> datetime.date:
 
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
-    return slug[:96] or "task"
+    # Strip again after the cut so a slug never ends in "-" and slugging a slug
+    # gives the same slug back.
+    return slug[:96].strip("-") or "task"
 
 
 def project_slug(value: str | None) -> str:
@@ -48,6 +50,20 @@ def project_slug(value: str | None) -> str:
 
 def stable_task_key(project: str | None, task_id_or_description: str | None) -> str:
     return f"{project_slug(project)}:{slugify(task_id_or_description or '')}"
+
+
+def answer_task_key(project: str | None, item_id: str | None) -> str:
+    """Key for an answer that names an item by the id Watson handed out.
+
+    Dashboard rows without a Memory task carry their task key as the id, so a
+    client sends that key straight back. Re-slugging it would prefix the project
+    twice and the answer would never match the row again.
+    """
+    raw = str(item_id or "").strip()
+    head, separator, tail = raw.partition(":")
+    if separator and head and tail and f"{slugify(head)}:{slugify(tail)}" == raw:
+        return raw
+    return stable_task_key(project, raw)
 
 
 def source_fingerprint(source_pointer: str | None, description: str | None = None) -> str | None:
@@ -120,6 +136,7 @@ class TaskDispositionStore:
         source_pointer: str | None = None,
         source_fingerprint_value: str | None = None,
         metadata: dict[str, Any] | None = None,
+        answered_at: str | None = None,
     ) -> dict[str, Any]:
         disposition_norm = str(disposition or "").strip().lower().replace("-", "_")
         if disposition_norm in {"wontdo", "won_t_do", "won't_do", "rejected"}:
@@ -132,13 +149,16 @@ class TaskDispositionStore:
             disposition_norm = "not_today"
         if disposition_norm not in TASK_DISPOSITIONS:
             raise ValueError(f"Invalid disposition {disposition!r}; expected one of {sorted(TASK_DISPOSITIONS)}")
-        now = utc_now()
+        # answered_at backdates an answer given earlier and only recorded now.
+        now = datetime.fromisoformat(answered_at).astimezone(timezone.utc).replace(microsecond=0).isoformat() if answered_at else utc_now()
         existing = self.get(task_key)
         created_at = str(existing.get("created_at")) if existing else now
         payload = {
             "task_key": task_key,
             "task_id": memory_task_numeric_id(task_id),
-            "source_fingerprint": source_fingerprint_value or source_fingerprint(source_pointer, description),
+            # No pointer, no fingerprint: a hash of the description alone would
+            # match the same wording in any other project.
+            "source_fingerprint": source_fingerprint_value or (source_fingerprint(source_pointer, description) if source_pointer else None),
             "disposition": disposition_norm,
             "reason": reason,
             "actor": actor,
@@ -236,6 +256,32 @@ class TaskDispositionStore:
                 except ValueError:
                     return True
         return True
+
+    def clear(
+        self,
+        *,
+        task_key: str | None = None,
+        task_id: Any = None,
+        source_fingerprint_value: str | None = None,
+    ) -> int:
+        """Forget every disposition that would match this item (an undo)."""
+        clauses = []
+        params: list[Any] = []
+        if task_key:
+            clauses.append("task_key = ?")
+            params.append(task_key)
+        numeric_id = memory_task_numeric_id(task_id)
+        if numeric_id:
+            clauses.append("task_id = ?")
+            params.append(numeric_id)
+        if source_fingerprint_value:
+            clauses.append("source_fingerprint = ?")
+            params.append(source_fingerprint_value)
+        if not clauses:
+            return 0
+        with self._connect() as conn:
+            cursor = conn.execute(f"DELETE FROM task_dispositions WHERE {' OR '.join(clauses)}", params)
+            return cursor.rowcount
 
     def list(self, disposition: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 2000))

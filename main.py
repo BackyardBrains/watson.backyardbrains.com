@@ -334,6 +334,7 @@ def current_priorities():
         "summary": data.get("summary"),
         "today_packet": data.get("today_packet"),
         "recommended_now": data.get("recommended_now", []),
+        "hidden_now": data.get("hidden_now", []),
     }
 
 
@@ -569,6 +570,7 @@ def get_current_priorities(privateKey: str | None = None) -> dict:
         "summary": data.get("summary"),
         "today_packet": data.get("today_packet"),
         "recommended_now": data.get("recommended_now", []),
+        "hidden_now": data.get("hidden_now", []),
     }
 
 
@@ -732,13 +734,44 @@ def set_task_disposition(
     _verify_private_key(privateKey)
     if not USE_MEMORY_API:
         raise ValueError("set_task_disposition requires USE_MEMORY_API=true")
-    from memory_client import get_tasks, record_task_disposition
-    tasks = get_tasks(include_complete=True, limit=1000)
-    task = next((item for item in tasks if str(item.get("id")) == str(task_id)), None)
+    from memory_client import get_task, record_task_disposition
+    # Looked up by id: the task list is capped at 200 rows and missed the rest.
+    task = get_task(task_id)
     if not task:
         raise ValueError(f"Task {task_id} not found")
     record = record_task_disposition(task=task, disposition=disposition, reason=reason or None)
     return {"ok": True, "disposition": record}
+
+
+@mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)
+def answer_today_item(
+    item_id: str,
+    disposition: str,
+    title: str = "",
+    project: str = "",
+    note: str = "",
+    snooze_until: str = "",
+    source: str = "",
+    privateKey: str | None = None,
+) -> dict:
+    """Apply Greg's answer to a Today item from get_current_priorities so it stays off Today.
+
+    item_id is the row's task_id, or its task_key when task_id is null. disposition: done, wont_do,
+    wrong, snoozed (needs snooze_until YYYY-MM-DD), not_today, answered (Greg decided; put his
+    decision in note), discuss (his comment in note), or reopen (undo). Pass the row's action as title
+    and its project. Use only for what Greg actually said or did.
+    """
+    _verify_private_key(privateKey)
+    return _record_task_answer(
+        item_id=item_id,
+        disposition=disposition,
+        todo={"title": title or item_id, "project": project or "general"},
+        reason=None,
+        note=note or None,
+        snooze_until=snooze_until or None,
+        actor="Greg",
+        source=source or "watson-mcp",
+    )
 
 
 @mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)
@@ -1362,10 +1395,15 @@ class PlaygroundTaskFeedbackPayload(BaseModel):
     reason: str | None = None
     snooze_until: str | None = None
     todo: dict[str, Any] | None = None
+    note: str | None = None
+    actor: str | None = None
+    source: str | None = None
+    answer_capture_id: int | None = None
+    answered_at: datetime | None = None
 
 
 def _normalize_dashboard_disposition(disposition: str) -> str:
-    raw = (disposition or "").strip().lower().replace("-", "_")
+    raw = (disposition or "").strip().lower().replace("-", "_").replace(" ", "_")
     if raw in {"done", "complete", "completed"}:
         return "done"
     if raw in {"wrong", "incorrect_fact", "changed_direction"}:
@@ -1376,15 +1414,18 @@ def _normalize_dashboard_disposition(disposition: str) -> str:
         return "snoozed"
     if raw in {"defer", "deferred", "delay", "delayed", "later"}:
         return "deferred"
-    if raw in {"not_today", "not-today", "not today", "not_now", "not-now"}:
+    if raw in {"not_today", "not_now"}:
         return "not_today"
-    raise HTTPException(status_code=422, detail="disposition must be done, wont_do, wrong, snoozed, deferred, or not_today")
-
-
-def _dashboard_task_key(todo_id: str, todo: dict[str, Any] | None) -> str:
-    from task_state import stable_task_key
-    project = (todo or {}).get("project") or (todo or {}).get("partOf") or "general"
-    return stable_task_key(str(project), str(todo_id))
+    if raw in {"answered", "handoff", "decided", "decision"}:
+        return "answered"
+    if raw in {"discuss", "comment", "note"}:
+        return "discuss"
+    if raw in {"reopen", "reopened", "undo", "active"}:
+        return "reopen"
+    raise HTTPException(
+        status_code=422,
+        detail="disposition must be done, wont_do, wrong, snoozed, deferred, not_today, answered, discuss, or reopen",
+    )
 
 
 def _find_capture_for_feedback(todo_id: str, todo: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1414,19 +1455,52 @@ def _find_capture_for_feedback(todo_id: str, todo: dict[str, Any] | None) -> dic
     return None
 
 
-def _find_canonical_task_for_feedback(todo_id: str, todo: dict[str, Any] | None) -> dict[str, Any] | None:
-    from memory_client import get_tasks
-    task_key = _dashboard_task_key(todo_id, todo)
-    try:
-        tasks = get_tasks(include_complete=True, limit=1000)
-    except Exception:
-        return None
-    for task in tasks:
-        if str(task.get("task_key") or "") == task_key:
-            return task
-        if str(task.get("id") or "") == str(todo_id) or str(task.get("@id") or "") == str(todo_id):
-            return task
-    return None
+def _record_task_answer(
+    *,
+    item_id: str,
+    disposition: str,
+    todo: dict[str, Any] | None,
+    reason: str | None,
+    note: str | None,
+    snooze_until: str | None,
+    actor: str | None,
+    source: str | None,
+    answer_capture_id: int | None = None,
+    answered_at: datetime | None = None,
+) -> dict[str, Any]:
+    if not USE_MEMORY_API:
+        raise HTTPException(status_code=422, detail="task answers require USE_MEMORY_API=true")
+    disposition = _normalize_dashboard_disposition(disposition)
+    if disposition == "snoozed" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(snooze_until or "")):
+        raise HTTPException(status_code=422, detail="snoozed feedback requires snooze_until as YYYY-MM-DD")
+    if disposition in {"answered", "discuss"} and not (note or "").strip():
+        raise HTTPException(status_code=422, detail=f"{disposition} feedback requires a note")
+    from memory_client import record_task_answer
+    result = record_task_answer(
+        item_id=item_id,
+        disposition=disposition,
+        todo=todo,
+        reason=reason,
+        note=(note or "").strip() or None,
+        snooze_until=snooze_until,
+        actor=(actor or "").strip() or "Greg",
+        source=(source or "").strip() or "dashboard",
+        answer_capture_id=answer_capture_id,
+        answered_at=answered_at.isoformat() if answered_at else None,
+    )
+    capture_flag = None
+    if disposition == "wrong":
+        capture = _find_capture_for_feedback(item_id, todo)
+        if capture:
+            from capture_quality import CaptureQualityStore
+            quality_db = Path(os.environ.get("WATSON_CAPTURE_QUALITY_DB", DATA_PATH / "memory" / "watson_capture_quality.sqlite3"))
+            capture_flag = CaptureQualityStore(quality_db).set_status(
+                capture,
+                "wrong_task_source",
+                reason=reason or "Task marked wrong in dashboard",
+                metadata={"task_key": result["task_key"], "dashboard_todo_id": item_id},
+            )
+    return {**result, "capture_flag": capture_flag}
 
 
 def playground_task_feedback_post(
@@ -1434,74 +1508,18 @@ def playground_task_feedback_post(
     secret: str = Depends(APIKeyQuery(name="secret", auto_error=False)),
 ):
     verify_secret(secret)
-    disposition = _normalize_dashboard_disposition(payload.disposition)
-    if disposition == "snoozed" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(payload.snooze_until or "")):
-        raise HTTPException(status_code=422, detail="snoozed feedback requires snooze_until as YYYY-MM-DD")
-    todo = payload.todo or {}
-    task = _find_canonical_task_for_feedback(payload.id, todo)
-    capture = _find_capture_for_feedback(payload.id, todo)
-    source_pointer = (
-        todo.get("source_pointer")
-        or todo.get("action_url")
-        or (capture or {}).get("source_pointer")
-        or None
-    )
-    description = todo.get("text") or todo.get("title") or todo.get("description") or payload.id
-
-    from task_state import TaskDispositionStore, source_fingerprint
-    store = TaskDispositionStore()
-    task_key = str((task or {}).get("task_key") or _dashboard_task_key(payload.id, todo))
-    source_fp = (task or {}).get("source_fingerprint") or source_fingerprint(str(source_pointer or ""), str(description or ""))
-    status_result = None
-    if USE_MEMORY_API and task and task.get("id") is not None:
-        if disposition in {"done", "wrong", "wont_do"}:
-            from memory_client import set_task_status
-            target_status = "done" if disposition == "done" else "dropped"
-            status_result = set_task_status(int(task["id"]), target_status)
-        elif disposition in {"snoozed", "deferred", "not_today"}:
-            from memory_client import set_task_attention
-            attention_state = "snoozed" if disposition in {"snoozed", "not_today"} else "deferred"
-            status_result = set_task_attention(
-                int(task["id"]),
-                attention_state,
-                reason=payload.reason,
-                snooze_until=payload.snooze_until if attention_state == "snoozed" else None,
-            )
-    record = store.record(
-        task_key=task_key,
-        task_id=(task or {}).get("id"),
-        disposition=disposition,
+    return _record_task_answer(
+        item_id=payload.id,
+        disposition=payload.disposition,
+        todo=payload.todo,
         reason=payload.reason,
-        actor="Greg",
-        source="dashboard",
-        project=todo.get("project") or (task or {}).get("partOf"),
-        description=str(description or ""),
-        source_pointer=str(source_pointer or "") or None,
-        source_fingerprint_value=str(source_fp or "") or None,
-        metadata={
-            "dashboard_todo_id": payload.id,
-            "memory_task": (task or {}).get("@id"),
-            "snooze_until_date": payload.snooze_until,
-        },
+        note=payload.note,
+        snooze_until=payload.snooze_until,
+        actor=payload.actor,
+        source=payload.source,
+        answer_capture_id=payload.answer_capture_id,
+        answered_at=payload.answered_at,
     )
-    capture_flag = None
-    if disposition == "wrong" and capture:
-        from capture_quality import CaptureQualityStore
-        quality_db = Path(os.environ.get("WATSON_CAPTURE_QUALITY_DB", DATA_PATH / "memory" / "watson_capture_quality.sqlite3"))
-        capture_flag = CaptureQualityStore(quality_db).set_status(
-            capture,
-            "wrong_task_source",
-            reason=payload.reason or "Task marked wrong in dashboard",
-            metadata={"task_key": task_key, "dashboard_todo_id": payload.id},
-        )
-    return {
-        "ok": True,
-        "task_key": task_key,
-        "memory_task": (task or {}).get("@id"),
-        "status_result": status_result,
-        "disposition": record,
-        "capture_flag": capture_flag,
-    }
 
 
 # --- Legacy Playground dashboard status API (retired) ---
